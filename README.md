@@ -48,6 +48,9 @@ python3 -m venv .venv && source .venv/bin/activate
 make install-dev      # installs dev tools and the git pre-commit hook
 ```
 
+Tests need Redis; start it with `make redis-up`. Tests use `REDIS_URL` (default
+`redis://localhost:6379/15`) and flush that DB, so never point it at real data.
+
 | Command          | What it does                                          |
 |------------------|-------------------------------------------------------|
 | `make format`    | Auto-fix lint issues (ruff) and format code (black)   |
