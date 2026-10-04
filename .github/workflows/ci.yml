@@ -38,9 +38,7 @@ jobs:
         run: ruff check --output-format=github .
 
       - name: mypy
-        # Skipped until the repo contains Python files; mypy exits 2 on an empty tree.
-        run: |
-          if [ -n "$(git ls-files '*.py')" ]; then mypy .; else echo "No Python files yet"; fi
+        run: mypy .
 
   test:
     name: Tests
@@ -74,6 +72,4 @@ jobs:
           pip install -r requirements-dev.txt
 
       - name: pytest
-        # Skipped until tests/ exists; pytest exits 5 when nothing is collected.
-        run: |
-          if [ -d tests ]; then pytest; else echo "No tests/ directory yet"; fi
+        run: pytest
