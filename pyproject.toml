@@ -1,0 +1,46 @@
+[project]
+name = "quota-metering"
+version = "0.1.0"
+description = "Per-customer, per-feature monthly quota metering backed by Redis"
+requires-python = ">=3.12"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "ASYNC", # flake8-async
+    "RUF",  # ruff-specific
+]
+# Line length is enforced by black.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["quota", "service"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+exclude = ["^build/", "^dist/"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*", "loadtest.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra"
