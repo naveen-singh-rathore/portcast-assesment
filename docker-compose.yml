@@ -1,4 +1,5 @@
-# Local Redis for development and tests:  docker compose up -d redis
+# Local Redis only:        docker compose up -d redis
+# Full stack (3 replicas): docker compose up --build -d   -> http://localhost:8080
 services:
   redis:
     image: redis:7.4-alpine
@@ -9,3 +10,30 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
       retries: 30
+
+  api:
+    build: .
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SEED_FILE: /app/quotas.yaml
+      DOWNSTREAM_FAILURE_RATE: "0.05"
+      FAIL_OPEN_FEATURES: ""
+    deploy:
+      replicas: 3
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 2s
+      retries: 30
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_healthy

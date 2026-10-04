@@ -1,0 +1,10 @@
+# Seed limits loaded at startup with SET NX (never overwrites admin changes).
+# Production: this would live in Postgres behind an admin API; see DESIGN.md.
+default:
+  container-tracking: 5000
+  sailing-schedule: 10000
+orgs:
+  count: 200            # generates org-0001 .. org-0200 with the default limits
+  overrides:
+    org-0001:
+      container-tracking: 500
