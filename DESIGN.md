@@ -49,13 +49,26 @@ scripts serially, so no other client can run between the comparison
 
 | Option | Why rejected |
 |---|---|
-| GET, compare, INCRBY | Race window between read and write; over-serves under contention |
+| GET, compare, INCRBY | Race window between read and write; over-serves under contention (measured: 818–1,633 units used on a limit of 500 across 3 runs, see proof below) |
 | WATCH/MULTI (optimistic CAS) | Correct, but bursts on one org cause retry storms exactly on hot keys; unbounded latency |
 | DECRBY then refund if negative | Counter goes briefly negative; concurrent requests are wrongly rejected; violates "never negative" |
 | Postgres `SELECT ... FOR UPDATE` | Correct, but row-lock queueing on hot orgs and ms-level latency per op; more load on the primary DB |
 | Per-instance counters / leases | Instances come and go; a crashed instance strands its share |
 
-A multi-process proof against real Redis follows in the next PR.
+### Proof: multi-process test against real Redis
+
+`tests/test_concurrency.py`: 8 OS processes (stand-ins for service instances), 50 concurrent
+requests each, released at the same instant by a barrier, against one counter in real Redis.
+
+- 400 one-unit requests vs limit 100: exactly 100 granted, `remaining == 0`.
+- 400 one-unit requests vs limit 400: all granted, `remaining == 0`.
+- Mixed batches (1–50 units) vs limit 500: `granted == used <= 500`, leftover smaller than
+  the largest batch.
+- Reserve/commit/release with 20% downstream failures: `granted == used`, `reserved == 0`.
+- **Control:** the same harness against a naive GET-then-INCRBY implementation must
+  over-serve, or the test fails. This proves the harness creates real contention, so the
+  passing tests are meaningful rather than lucky. Measured: naive used 818–1,633 units on a
+  limit of 500 across 3 runs.
 
 ## Batch policy: all-or-nothing
 
