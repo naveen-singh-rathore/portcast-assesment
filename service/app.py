@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -35,6 +36,7 @@ from quota import (
     QuotaExceeded,
     QuotaNotConfigured,
     QuotaUnavailable,
+    RateLimited,
 )
 from quota.keys import keys_for
 
@@ -71,11 +73,38 @@ def load_seed(path: str | Path) -> list[tuple[str, str, int]]:
     return rows
 
 
+def load_burst_seed(path: str | Path) -> list[tuple[str, str, int, int]]:
+    """Parse the optional `burst:` section into (org, feature, units, window_ms) rows."""
+    cfg = yaml.safe_load(Path(path).read_text())
+    burst = cfg.get("burst") or {}
+    defaults: dict[str, dict[str, Any]] = burst.get("default") or {}
+    overrides: dict[str, dict[str, dict[str, Any]]] = burst.get("overrides") or {}
+    rows = []
+    for i in range(1, int(cfg["orgs"]["count"]) + 1):
+        org = f"org-{i:04d}"
+        for feature, b in {**defaults, **overrides.get(org, {})}.items():
+            units, window_s = b.get("units"), b.get("window_s")
+            if not isinstance(units, int) or units < 0:
+                raise ValueError(f"{path}: burst units for {org}/{feature} must be an int >= 0")
+            if not isinstance(window_s, int | float) or window_s < 0.001:
+                raise ValueError(f"{path}: burst window_s for {org}/{feature} must be >= 0.001")
+            rows.append((org, feature, units, int(window_s * 1000)))
+    return rows
+
+
 async def seed_limits(r: Redis, rows: list[tuple[str, str, int]]) -> None:
     """SET NX: seeding never overwrites a limit an admin has changed since."""
     pipe = r.pipeline(transaction=False)
     for org, feature, limit in rows:
         pipe.set(keys_for(org, feature, "_").limit, limit, nx=True)
+    await pipe.execute()
+
+
+async def seed_bursts(r: Redis, rows: list[tuple[str, str, int, int]]) -> None:
+    """SET NX, like seed_limits: an admin's burst change survives a restart."""
+    pipe = r.pipeline(transaction=False)
+    for org, feature, units, window_ms in rows:
+        pipe.set(keys_for(org, feature, "_").burst, f"{units}/{window_ms}", nx=True)
     await pipe.execute()
 
 
@@ -94,6 +123,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.quota = QuotaClient(r, reservation_ttl=timedelta(seconds=RESERVATION_TTL_S))
     if seed_file := os.environ.get("SEED_FILE"):
         await seed_limits(r, load_seed(seed_file))
+        await seed_bursts(r, load_burst_seed(seed_file))
     yield
     await r.aclose()
 
@@ -116,6 +146,25 @@ async def _exceeded(_: Request, e: QuotaExceeded) -> JSONResponse:
             "requested": e.requested,
             "remaining": e.remaining,
         },
+    )
+
+
+@app.exception_handler(RateLimited)
+async def _rate_limited(_: Request, e: RateLimited) -> JSONResponse:
+    # No Retry-After when the batch is bigger than a whole window: retrying never helps.
+    headers = {}
+    if e.retry_after_s is not None:
+        headers["Retry-After"] = str(max(1, math.ceil(e.retry_after_s)))
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "rate_limited",
+            "feature": e.feature,
+            "requested": e.requested,
+            "burst_limit": e.burst_limit,
+            "retry_after_s": e.retry_after_s,
+        },
+        headers=headers,
     )
 
 
@@ -201,6 +250,8 @@ async def track_containers(
 
     if res.status == "REJECTED":
         raise QuotaExceeded(body.org, TRACKING, units, res.remaining)
+    if res.status == "RATE_LIMITED":
+        raise res.rate_limited(body.org, TRACKING, units)
     if res.status == "DUPLICATE":
         if res.state == "held":
             raise DuplicateInFlight(idempotency_key or "")
@@ -241,17 +292,28 @@ async def search_schedules(
     )
     if res.status == "REJECTED":
         raise QuotaExceeded(org, SCHEDULES, 1, res.remaining)
+    if res.status == "RATE_LIMITED":
+        raise res.rate_limited(org, SCHEDULES, 1)
     return {"results": [], "remaining": res.remaining}
 
 
 # ---- reporting + admin -------------------------------------------------------
 @app.get("/v1/quota/{org}/{feature}")
-async def get_usage(org: str, feature: str) -> dict[str, str | int]:
+async def get_usage(org: str, feature: str) -> dict[str, object]:
     return (await _quota().usage(org, feature)).as_dict()
 
 
 class LimitBody(BaseModel):
     limit: int = Field(ge=0)
+
+
+class BurstBody(BaseModel):
+    units: int = Field(ge=0)
+    window_s: float = Field(ge=0.001)
+
+
+def _authorized(authorization: str | None) -> bool:
+    return not ADMIN_TOKEN or hmac.compare_digest(authorization or "", f"Bearer {ADMIN_TOKEN}")
 
 
 @app.put("/v1/quota/{org}/{feature}", response_model=None)
@@ -260,10 +322,35 @@ async def set_limit(
     feature: str,
     body: LimitBody,
     authorization: Annotated[str | None, Header()] = None,
-) -> dict[str, str | int] | JSONResponse:
-    if ADMIN_TOKEN and not hmac.compare_digest(authorization or "", f"Bearer {ADMIN_TOKEN}"):
+) -> dict[str, object] | JSONResponse:
+    if not _authorized(authorization):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     await _quota().set_limit(org, feature, body.limit)
+    return (await _quota().usage(org, feature)).as_dict()
+
+
+@app.put("/v1/quota/{org}/{feature}/burst", response_model=None)
+async def set_burst(
+    org: str,
+    feature: str,
+    body: BurstBody,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, object] | JSONResponse:
+    if not _authorized(authorization):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    await _quota().set_burst_limit(org, feature, body.units, timedelta(seconds=body.window_s))
+    return (await _quota().usage(org, feature)).as_dict()
+
+
+@app.delete("/v1/quota/{org}/{feature}/burst", response_model=None)
+async def clear_burst(
+    org: str,
+    feature: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, object] | JSONResponse:
+    if not _authorized(authorization):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    await _quota().clear_burst_limit(org, feature)
     return (await _quota().usage(org, feature)).as_dict()
 
 

@@ -5,6 +5,8 @@ Redis Cluster they land on the same slot and one Lua script can touch them
 all atomically.
 
   q:{org:feat}:limit              STRING  monthly limit (config, not per period)
+  q:{org:feat}:burst              STRING  "units/window_ms" burst limit (config, optional)
+  q:{org:feat}:win                HASH    start, n: units admitted in the current window
   q:{org:feat}:<period>           HASH    used, reserved
   q:{org:feat}:<period>:res       ZSET    reservation_id -> expires_at_ms
   q:{org:feat}:<period>:resunits  HASH    reservation_id -> units
@@ -34,6 +36,8 @@ def _tag(org: str, feature: str) -> str:
 @dataclass(frozen=True)
 class QuotaKeys:
     limit: str
+    burst: str
+    window: str
     state: str
     res: str
     resunits: str
@@ -53,6 +57,8 @@ class QuotaKeys:
             self.resunits,
             self.done,
             self.idem(idem_key) if idem_key else self.idem("_none"),
+            self.burst,
+            self.window,
         ]
 
 
@@ -61,6 +67,8 @@ def keys_for(org: str, feature: str, period_id: str) -> QuotaKeys:
     base = f"{t}:{period_id}"
     return QuotaKeys(
         limit=f"{t}:limit",
+        burst=f"{t}:burst",
+        window=f"{t}:win",
         state=base,
         res=f"{base}:res",
         resunits=f"{base}:resunits",

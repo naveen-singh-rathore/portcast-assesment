@@ -22,11 +22,16 @@ prints `AUDIT FAILED` and exits non-zero. Some `502` responses are expected: the
 simulates a 5% downstream failure rate (`DOWNSTREAM_FAILURE_RATE`), and those holds are
 released. The stack stays up on http://localhost:8080 until `make down`.
 
+The audit compares what clients were granted with the growth in `used` during the run (it
+snapshots usage first), so repeated runs pass without a reset. Usage does pile up within
+the month, though: after a few runs most orgs are at their limit and nearly every request
+is a `429 quota_exceeded`. Run `make down` first to measure the grant path.
+
 ## Running tests
 
 ```bash
 make redis-up   # Redis 7.4 in Docker on localhost:6379
-make test       # pytest on the host; expect 78 passed
+make test       # pytest on the host; expect 108 passed
 ```
 
 Without Docker: start any Redis on port 6379 (`redis-server`), then run `pytest`. Tests use
@@ -60,10 +65,11 @@ for limits.
 
 | Run | Result |
 |---|---|
-| `make check` | 78 tests passed |
+| `make check` | 78 tests passed (108 with the burst limit, 5 October 2026) |
 | Concurrency control (`tests/test_concurrency.py`, 3 runs) | Naive GET-then-INCRBY used 818, 1,633 and 1,418 units on a limit of 500. The Lua-backed tests stayed at or under the limit in every run |
 | `make bench` (4 processes x 32 loops, 5,000 orgs, 20 s) | 53,707 quota ops/s; latency p50 2.278 ms, p95 3.758 ms, p99 4.822 ms; **0 invariant violations** across 4,985 orgs. No org reached its limit, so this measures the grant path |
 | `make load` (3 replicas, target 300 req/s, 60 s) | 15,056 requests at 251 req/s achieved. Quota overhead p50 0.563 ms, p99 1.161 ms; end to end p50 9.34 ms, p99 14.78 ms. Status codes: 200: 14,290, 502: 713 (simulated failures), 429: 53. **Audit passed:** 0 orgs over their limit and 0 mismatches across 200 orgs |
+| `make load` with burst limits (300 units/s per org; 100 for org-0001), 5 October 2026 | 15,031 requests at 250 req/s. Quota overhead p50 0.58 ms, p99 1.261 ms. Status codes: 200: 13,985, 502: 692, 429: 354 (343 `rate_limited`, 11 `quota_exceeded`). **Audit passed:** 0 over-limit, 0 mismatches across 200 orgs, on a fresh stack |
 | `make load` with faults: one API replica killed at 15 s, Redis restarted at 30 s | 14,496 requests; 109 fast 503s while Redis restarted (fail closed); the other two replicas took the killed one's traffic. **Audit passed:** 0 over-limit, 0 mismatches |
 | Redis `INFO commandstats` | 13.71 µs per `EVALSHA`, so one Redis node tops out at about 73,000 quota ops/s (computed, not measured) |
 
@@ -83,6 +89,9 @@ for limits.
 - Periods are calendar months in UTC ([quota/periods.py](quota/periods.py)). The period id is
   part of every counter key, so a new month starts on fresh keys and no reset job is needed:
   [quota/keys.py](quota/keys.py).
+- An optional **burst limit** caps how fast an org can spend its quota: at most N units per
+  fixed window (e.g. 300 per second). It is checked in the same script as the monthly limit,
+  so a request is admitted only if it fits both. See [DESIGN.md](DESIGN.md#burst-limit-fixed-window-per-org-feature).
 - All keys for one (org, feature) share the hash tag `{org:feature}`, so scripts also work on
   Redis Cluster.
 
@@ -94,8 +103,10 @@ Served by [service/app.py](service/app.py). Through nginx, it's on http://localh
 |---|---|---|---|
 | POST | `/v1/containers/track` | Yes: 1 unit per container; reserve, then commit or release | 200, 400, 403, 409, 422, 429, 502, 503 |
 | GET | `/v1/schedules/search?org=` | Yes: 1 unit, one-shot `consume()` | 200, 400, 403, 422, 429, 503 |
-| GET | `/v1/quota/{org}/{feature}` | No: usage for the current month | 200, 400, 403, 503 |
+| GET | `/v1/quota/{org}/{feature}` | No: usage for the current month, and the burst window if one is set | 200, 400, 403, 503 |
 | PUT | `/v1/quota/{org}/{feature}` | No: set the limit, body `{"limit": n}` | 200, 400, 401, 422, 503 |
+| PUT | `/v1/quota/{org}/{feature}/burst` | No: set the burst limit, body `{"units": n, "window_s": s}` | 200, 400, 401, 403, 422, 503 |
+| DELETE | `/v1/quota/{org}/{feature}/burst` | No: remove the burst limit | 200, 400, 401, 403, 503 |
 | GET | `/healthz` | No | 200, 503 |
 
 What each code means:
@@ -105,7 +116,9 @@ What each code means:
 - `409`: the same `Idempotency-Key` is still in progress. Comes with `Retry-After: 1`.
 - `422`: the request fails validation, or (`idempotency_key_reused`) the same
   `Idempotency-Key` was used before with a different body.
-- `429`: not enough quota. Batches are all-or-nothing.
+- `429`: not enough quota (`quota_exceeded`), or the burst window is full (`rate_limited`,
+  with `Retry-After` until the window resets). Batches are all-or-nothing. A batch larger
+  than the whole window gets no `Retry-After`: split it.
 - `502`: the downstream work failed or took longer than `DOWNSTREAM_TIMEOUT_S`, and the
   reserved quota was returned.
 - `503`: Redis is unreachable.
@@ -130,6 +143,9 @@ async def track(org: str, containers: list[str], request_id: str) -> None:
 
 `hold()` raises these errors:
 - `QuotaExceeded`: not enough quota. It carries `remaining`.
+- `RateLimited`: the burst window is full. It carries `burst_limit` and `retry_after_s`
+  (`None` if the batch can never fit a window). Set limits with
+  `quota.set_burst_limit(org, feature, units, timedelta(seconds=1))`.
 - `QuotaNotConfigured`: no limit is set.
 - `DuplicateInFlight`: the same key is still being processed.
 - `IdempotencyKeyReused`: the key was used before with a different request. Pass a
@@ -156,7 +172,9 @@ async def track(org: str, containers: list[str], request_id: str) -> None:
 generates orgs `org-0001` to `org-NNNN` from `orgs.count`, and applies per-org `overrides`.
 At startup the service checks that every limit is an integer >= 0, and fails to start
 otherwise. It then writes each limit with `SET NX`. A restart therefore never overwrites a
-limit that was changed later through `PUT /v1/quota/{org}/{feature}`.
+limit that was changed later through `PUT /v1/quota/{org}/{feature}`. The optional `burst:`
+section works the same way (`default` per feature plus per-org `overrides`, each
+`{units, window_s}`), and is seeded with `SET NX` too.
 
 ## Development
 
@@ -174,14 +192,14 @@ make check         # what CI runs (.github/workflows/ci.yml), with tests against
 quota/              the library
   periods.py        calendar-month UTC periods
   keys.py           Redis key layout and identifier validation
-  scripts.py        Lua scripts: reserve/consume, commit, release, extend, usage
+  scripts.py        Lua scripts: reserve/consume (monthly + burst window), commit, release, extend, usage
   client.py         async QuotaClient, hold(), extend()
   errors.py         error types
 service/app.py      FastAPI demo service that uses the library
 loadtest/
   bench.py          library benchmark with invariant audit
   loadgen.py        HTTP load generator with client/Redis audit
-tests/              78 tests (unit, real Redis, multi-process, HTTP, audit logic)
+tests/              108 tests (unit, real Redis, multi-process, HTTP, audit logic)
 quotas.yaml         seed limits
 docker-compose.yml  Redis, 3 API replicas, nginx; loadgen/bench under profiles
 Dockerfile          multi-stage: api and loadtest images

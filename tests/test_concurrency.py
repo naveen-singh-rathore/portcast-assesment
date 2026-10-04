@@ -14,6 +14,7 @@ import asyncio
 import multiprocessing as mp
 import os
 import random
+from datetime import UTC, datetime
 from typing import Any
 
 from redis import Redis as SyncRedis
@@ -27,6 +28,9 @@ ORG, FEAT = "acme", "container-tracking"
 NAIVE_KEY = "naive:used"
 PROCS = 8  # "instances"
 TASKS_PER_PROC = 50  # concurrent requests inside each instance
+# Burst storms pin every worker to one instant, so all requests land in one window
+# no matter when the test runs.
+PINNED = datetime(2026, 10, 15, 12, 0, 0, 500_000, tzinfo=UTC)
 
 
 def _sizes(seed: int, n: int, mode: str) -> list[int]:
@@ -38,11 +42,11 @@ def _sizes(seed: int, n: int, mode: str) -> list[int]:
 
 async def _worker_quota(seed: int, n: int, mode: str, flow: str, limit: int) -> int:
     r = Redis.from_url(REDIS_URL, max_connections=n)
-    q = QuotaClient(r)
+    q = QuotaClient(r, clock=lambda: PINNED) if flow == "burst" else QuotaClient(r)
     rnd = random.Random(seed * 7)
 
     async def one(units: int) -> int:
-        if flow == "consume":
+        if flow in ("consume", "burst"):
             res = await q.consume(ORG, FEAT, units)
             return units if res.status == "OK" else 0
         # reserve -> (maybe fail) -> commit/release
@@ -93,10 +97,14 @@ def _proc(kind: str, seed: int, mode: str, flow: str, limit: int, barrier: Any, 
         raise
 
 
-def run_storm(kind: str, limit: int, mode: str = "unit", flow: str = "consume") -> int:
+def run_storm(
+    kind: str, limit: int, mode: str = "unit", flow: str = "consume", burst: int | None = None
+) -> int:
     with SyncRedis.from_url(REDIS_URL) as sync:
         sync.flushdb()
         sync.set(keys_for(ORG, FEAT, "_").limit, limit)
+        if burst is not None:
+            sync.set(keys_for(ORG, FEAT, "_").burst, f"{burst}/1000")
     ctx = mp.get_context("spawn")
     barrier, out = ctx.Barrier(PROCS), ctx.Queue()
     procs = [
@@ -115,11 +123,12 @@ def run_storm(kind: str, limit: int, mode: str = "unit", flow: str = "consume") 
     return total
 
 
-def _usage() -> Usage:
+def _usage(pinned: bool = False) -> Usage:
     async def go() -> Usage:
         r = Redis.from_url(REDIS_URL)
         try:
-            return await QuotaClient(r).usage(ORG, FEAT)
+            q = QuotaClient(r, clock=lambda: PINNED) if pinned else QuotaClient(r)
+            return await q.usage(ORG, FEAT)
         finally:
             await r.aclose()
 
@@ -154,6 +163,22 @@ def test_reserve_commit_release_under_contention() -> None:
     u = _usage()
     assert granted == u.used <= 300
     assert u.reserved == 0  # every hold resolved: no leaked quota
+
+
+def test_burst_window_fills_exactly_under_contention() -> None:
+    # 400 one-unit requests in one 1 s window allowing 60; the month allows 1,000.
+    granted = run_storm("quota", limit=1000, mode="unit", flow="burst", burst=60)
+    u = _usage(pinned=True)
+    assert granted == 60 == u.used  # the window, not the month, was the binding limit
+    assert u.burst is not None and u.burst.used == 60 and u.remaining == 940
+
+
+def test_burst_window_never_over_serves_mixed_batches() -> None:
+    granted = run_storm("quota", limit=10_000, mode="mixed", flow="burst", burst=200)
+    u = _usage(pinned=True)
+    assert granted == u.used <= 200
+    assert u.burst is not None and u.burst.used == granted
+    assert 200 - granted < 50  # leftover is smaller than the largest batch
 
 
 def test_control_naive_read_then_write_over_serves() -> None:

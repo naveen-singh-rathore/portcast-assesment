@@ -82,6 +82,49 @@ into many. Callers that can split work can retry with `remaining` units. Cost: a
 can be refused while smaller ones keep succeeding (no fairness/queueing).
 `commit(actual_units)` covers the opposite case: reserve 100, find 3 invalid, charge 97.
 
+## Burst limit: fixed window per (org, feature)
+
+The monthly limit alone lets one org spend its whole month in a few seconds and starve
+everyone else on the shared fleet. So each (org, feature) can also have an optional burst
+limit: at most `units` per `window` (e.g. 300 containers per 1 s), set in `quotas.yaml`
+under `burst:` or with `PUT /v1/quota/{org}/{feature}/burst`. No entry means no limit.
+
+- **Same script, same atomicity.** The window check runs inside `RESERVE`, after the
+  monthly check and before any write. A request is admitted only if it fits both; if
+  either fails nothing is written. All-or-nothing applies to the window too.
+- **Which reason wins:** if the month is exhausted the caller gets `quota_exceeded`, since
+  waiting for the window would not help. Otherwise `rate_limited` with the time until the
+  window resets (HTTP `429` + `Retry-After`).
+- **Windows are aligned to the epoch on the Redis clock** (`start = now - now % window`), so
+  every instance agrees where a window starts without coordinating.
+- **State is one small hash** `q:{org:feat}:win` = `{start, n}` that expires at the window
+  end. A stored `start` that differs from the current window means it is stale and counts
+  as 0, so no reset job is needed, as with months. Both keys share the `{org:feature}` hash
+  tag, so this stays cluster-safe.
+- **The window counts admissions.** A `release` gives the units back to the month but not
+  to the window: the window limits how fast work is started, and released work was
+  started. An idempotent replay (`DUPLICATE`) is answered before the window check and
+  uses no window capacity.
+- **A batch larger than a whole window** can never fit. It gets `rate_limited` with no
+  `Retry-After` (`retry_after_s: null`), so the caller splits it instead of retrying.
+
+| Option | Why not chosen |
+|---|---|
+| Sliding log (ZSET of timestamps) | Exact, but one entry per request: memory and time grow with traffic |
+| Sliding window counter (weighted previous + current) | Smooths the boundary, but it is an estimate, and a cap that is "about N" is harder to explain and test |
+| Token bucket | Smooth refill, but needs fractional state and a refill rate as well as a size; overkill for "N per window" |
+| Fixed window (chosen) | One counter, O(1), exact within a window, easy to reason about and to show on `GET /v1/quota` |
+
+Cost of fixed windows: an org can send `units` at the very end of one window and `units`
+again at the start of the next, so the worst case over any window-length span is **2×** the
+limit. That is acceptable for load protection. If it is not, the sliding window counter is
+the next step and fits in the same script.
+
+Proof: `tests/test_concurrency.py` runs 8 processes × 50 requests into one window (workers
+pin the clock so the run cannot straddle a boundary). With a window of 60 and a month of
+1,000, exactly 60 are granted. With mixed batches against a window of 200,
+`granted == used == window count <= 200`. `tests/test_burst.py` covers the rules above.
+
 ## Failure and retries: reserve → commit / release, idempotency keys
 
 - `reserve` holds units (counted against remaining) with a 30 s TTL.
@@ -129,6 +172,7 @@ nginx (`docker-compose.yml`). Replicas share nothing but Redis.
 | Body fails validation (e.g. more than 1,000 containers) | 422 | FastAPI's `detail` |
 | Same `Idempotency-Key` reused with a different body | 422 | `idempotency_key_reused` |
 | Not enough quota (all-or-nothing) | 429 | `quota_exceeded` (+ `requested`, `remaining`) |
+| Burst window full; `Retry-After` unless the batch is larger than the whole window | 429 | `rate_limited` (+ `requested`, `burst_limit`, `retry_after_s`) |
 | Downstream work failed; hold released | 502 | `downstream_failed` |
 | Redis unreachable, feature fails closed | 503 | `quota_unavailable` |
 
@@ -163,7 +207,9 @@ Two tools, both ending in a correctness audit, so a fast-but-wrong run fails:
 - `loadtest/loadgen.py` (`make load`): HTTP through nginx to 3 replicas, bursty per org,
   5% downstream failures, client retries reusing the `Idempotency-Key` (always on a lost
   response, plus 5% of delivered ones). Audit per org touched: `used <= limit`, and
-  `used` equals units clients were told succeeded. A request whose every attempt died in
+  the growth in `used` during the run (usage is snapshotted
+  first, so data from earlier runs in the month does not count) equals units clients were
+  told succeeded. A request whose every attempt died in
   transit has an unknown outcome, so `used` may lie anywhere in
   `[known, known + unknown]`; anything outside that range fails the run.
 
@@ -198,6 +244,8 @@ the load generators all ran on that one machine:
 - **Idempotency across a month boundary:** a committed key retried next month is not
   recognised (its done-marker lives in last month's keys).
 - **Hot single counter:** all ops for one (org, feature) serialise on one slot.
+- **Fixed-window boundary:** up to 2× the burst limit can be admitted across two adjacent
+  windows (see Burst limit).
 - **Sweep is bounded:** at most 100 expired holds cleared per call. After a mass crash,
   `reserved` stays too high until later calls clear the rest, so some requests may be
   rejected that should have been granted (under-serving, never over-serving).

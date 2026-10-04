@@ -2,7 +2,9 @@
 
 Bursty per org (a few large batches, then quiet), client retries that reuse
 the Idempotency-Key, and a final audit against Redis for every org touched:
-never over the limit, and Redis `used` matches what clients were told.
+never over the limit, and the growth in Redis `used` during the run matches what
+clients were told. Usage is snapshotted before the run, so earlier runs in the
+same month (data left in Redis) do not fail the audit.
 
     python -m loadtest.loadgen --targets http://localhost:8080 --seconds 30 --rps 500
 """
@@ -40,6 +42,7 @@ class Stats:
     quota_ms: list[float] = field(default_factory=list)
     codes: Counter[str] = field(default_factory=Counter)
     instances: Counter[str] = field(default_factory=Counter)
+    rejections: Counter[str] = field(default_factory=Counter)  # 429 by reason
     retries: int = 0
     replayed: int = 0
 
@@ -49,12 +52,19 @@ def pct(xs: list[float], p: float) -> float | None:
     return round(xs[min(len(xs) - 1, int(len(xs) * p))], 3) if xs else None
 
 
-def audit(outcomes: list[Outcome], usage: dict[str, tuple[int, int]]) -> dict[str, Any]:
-    """Compare client-side outcomes with Redis. usage: org -> (used, limit).
+def audit(
+    outcomes: list[Outcome],
+    usage: dict[str, tuple[int, int]],
+    baseline: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Compare client-side outcomes with Redis. usage: org -> (used, limit) after the run;
+    baseline: org -> used before it (missing: 0).
 
     A request whose every attempt failed in transit has an unknown outcome, so
-    Redis `used` must lie in [known_granted, known_granted + unknown_units].
+    the growth in `used` must lie in [known_granted, known_granted + unknown_units].
+    `used` itself (including earlier runs) must never exceed the limit.
     """
+    baseline = baseline or {}
     known: Counter[str] = Counter()
     unknown: Counter[str] = Counter()
     for o in outcomes:
@@ -66,12 +76,20 @@ def audit(outcomes: list[Outcome], usage: dict[str, tuple[int, int]]) -> dict[st
     for org, (used, limit) in usage.items():
         if used > limit:
             over_limit.append(org)
-        if not known[org] <= used <= known[org] + unknown[org]:
+        before = baseline.get(org, 0)
+        if not known[org] <= used - before <= known[org] + unknown[org]:
             mismatches.append(
-                {"org": org, "client_granted": known[org], "unknown": unknown[org], "used": used}
+                {
+                    "org": org,
+                    "client_granted": known[org],
+                    "unknown": unknown[org],
+                    "used_before": before,
+                    "used": used,
+                }
             )
     return {
         "orgs_audited": len(usage),
+        "used_before_run_units": sum(baseline.get(org, 0) for org in usage),
         "over_limit_orgs": len(over_limit),
         "granted_vs_used_mismatches": len(mismatches),
         "mismatch_detail": mismatches[:10],
@@ -89,6 +107,15 @@ async def wait_for_fleet(c: httpx.AsyncClient, targets: list[str], tries: int = 
             pass
         await asyncio.sleep(1)
     raise SystemExit("fleet never became healthy")
+
+
+async def fetch_used(c: httpx.AsyncClient, target: str, orgs: list[str]) -> dict[str, int]:
+    async def one(org: str) -> tuple[str, int]:
+        resp = await c.get(f"{target}/v1/quota/{org}/{FEATURE}")
+        resp.raise_for_status()
+        return org, int(resp.json()["used"])
+
+    return dict(await asyncio.gather(*[one(org) for org in orgs]))
 
 
 async def main() -> None:
@@ -109,6 +136,9 @@ async def main() -> None:
 
     async with httpx.AsyncClient(timeout=5, limits=httpx.Limits(max_connections=a.conc)) as c:
         await wait_for_fleet(c, targets)
+        # This run's orgs may already carry usage this month (e.g. an earlier run).
+        orgs = [f"org-{i:04d}" for i in range(1, a.orgs + 1)]
+        baseline = await fetch_used(c, targets[0], orgs)
 
         async def attempt(o: Outcome, key: str) -> bool:
             """One HTTP attempt. Returns False if it died in transit."""
@@ -131,6 +161,8 @@ async def main() -> None:
                 stats.quota_ms.append(float(resp.headers["X-Quota-Ms"]))
             if "X-Instance" in resp.headers:
                 stats.instances[resp.headers["X-Instance"]] += 1
+            if resp.status_code == 429:
+                stats.rejections[resp.json().get("error", "unknown")] += 1
             if resp.status_code == 200:
                 o.succeeded = True
                 if resp.json().get("replayed"):
@@ -164,12 +196,13 @@ async def main() -> None:
             usage[org] = (int(u["used"]), int(u["limit"]))
 
     total = sum(stats.codes.values())
-    result = audit(outcomes, usage)
+    result = audit(outcomes, usage, baseline)
     report = {
         "requests": total,
         "elapsed_s": round(elapsed, 1),
         "achieved_rps": round(total / elapsed),
         "status_codes": dict(stats.codes),
+        "rejections_429": dict(stats.rejections),
         "client_retries": stats.retries,
         "replayed_by_idempotency": stats.replayed,
         "instances_seen": dict(stats.instances),
