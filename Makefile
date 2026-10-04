@@ -1,4 +1,4 @@
-.PHONY: install-dev format lint typecheck test check redis-up redis-down up down
+.PHONY: install-dev format lint typecheck test check redis-up redis-down up down load bench
 
 install-dev:
 	pip install -r requirements-dev.txt
@@ -33,3 +33,13 @@ up:
 
 down:
 	docker compose down -v
+
+# Full stack + 60 s HTTP load test; exits non-zero if the audit fails
+load:
+	docker compose up --build -d --wait
+	docker compose --profile load run --rm --build loadgen
+
+# Library-only latency/throughput + invariant audit
+bench:
+	docker compose up -d --wait redis
+	docker compose --profile bench run --rm --build bench

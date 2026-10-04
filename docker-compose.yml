@@ -1,5 +1,6 @@
 # Local Redis only:        docker compose up -d redis
 # Full stack (3 replicas): docker compose up --build -d   -> http://localhost:8080
+# HTTP load test:          make load      Library benchmark: make bench
 services:
   redis:
     image: redis:7.4-alpine
@@ -12,7 +13,9 @@ services:
       retries: 30
 
   api:
-    build: .
+    build:
+      context: .
+      target: api
     environment:
       REDIS_URL: redis://redis:6379/0
       SEED_FILE: /app/quotas.yaml
@@ -36,4 +39,28 @@ services:
       - "8080:80"
     depends_on:
       api:
+        condition: service_healthy
+
+  loadgen:
+    build:
+      context: .
+      target: loadtest
+    profiles: ["load"]
+    command: ["python", "-m", "loadtest.loadgen", "--targets", "http://lb",
+              "--seconds", "60", "--rps", "300", "--orgs", "200"]
+    depends_on:
+      lb:
+        condition: service_started
+
+  bench:
+    build:
+      context: .
+      target: loadtest
+    profiles: ["bench"]
+    # db 14: bench flushes its DB first, so it must never share the api's db 0.
+    command: ["python", "-m", "loadtest.bench", "--procs", "4", "--conc", "32", "--seconds", "20"]
+    environment:
+      REDIS_URL: redis://redis:6379/14
+    depends_on:
+      redis:
         condition: service_healthy
