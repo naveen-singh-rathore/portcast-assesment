@@ -5,3 +5,5 @@ mypy==2.4.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pre-commit==4.6.2
+httpx==0.28.1
+types-PyYAML==6.0.12.20260906
