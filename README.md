@@ -46,7 +46,23 @@ It prints JSON with `throughput_ops_s`, `latency_ms` (p50/p95/p99/max/mean),
 `rejected_requests`, `orgs_touched` and `invariant_violations`. For every org touched it checks
 `granted == used <= limit` and `reserved == 0`, and exits non-zero (`INVARIANT VIOLATED`) if
 any org fails. To run it without Docker: `python -m loadtest.bench --procs 4 --conc 64 --seconds 15`.
-Measured numbers are in [DESIGN.md](DESIGN.md#load-test).
+Measured numbers are under [Results](#results).
+
+## Results
+
+Measured on 4 October 2026 on an Apple M3 laptop (8 cores, 8 GB RAM) with Docker Desktop
+limited to 8 CPUs and 4 GB. Redis, the 3 replicas, nginx and the load generators all ran on
+that one machine. Your numbers will differ; the audits should still pass.
+[DESIGN.md](DESIGN.md#load-test) is the main record, along with what these numbers mean
+for limits.
+
+| Run | Result |
+|---|---|
+| `make check` | 64 tests passed |
+| Concurrency control (`tests/test_concurrency.py`, 3 runs) | Naive GET-then-INCRBY used 818, 1,633 and 1,418 units on a limit of 500. The Lua-backed tests stayed at or under the limit in every run |
+| `make bench` (4 processes x 32 loops, 5,000 orgs, 20 s) | 56,354 quota ops/s; latency p50 2.136 ms, p95 3.692 ms, p99 4.714 ms; **0 invariant violations** across 4,992 orgs. No org reached its limit, so this measures the grant path only |
+| `make load` (3 replicas, target 300 req/s, 60 s) | 15,013 requests at 250 req/s achieved. Quota overhead p50 0.539 ms, p99 1.521 ms; end to end p50 9.46 ms, p99 15.22 ms. Status codes: 200: 14,260, 502: 706 (simulated failures), 429: 47. **Audit passed:** 0 orgs over their limit and 0 mismatches across 200 orgs |
+| Redis `INFO commandstats` | 12.74 µs per `EVALSHA`, so one Redis node tops out at about 78,000 quota ops/s |
 
 ## How it works
 
@@ -130,6 +146,7 @@ limit that was changed later through `PUT /v1/quota/{org}/{feature}`.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt   # runtime deps (redis, fastapi, ...); the tests import them
 make install-dev   # dev tools + the git pre-commit hook (black, ruff, mypy, file checks)
 make format        # auto-fix lint issues and reformat
 make check         # what CI runs (.github/workflows/ci.yml), with tests against Redis 7.4
