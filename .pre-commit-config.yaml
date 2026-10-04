@@ -28,4 +28,4 @@ repos:
     hooks:
       - id: mypy
         # The hook runs in an isolated env; list imported third-party packages here.
-        additional_dependencies: ["pytest==9.1.1"]
+        additional_dependencies: ["pytest==9.1.1", "pytest-asyncio==1.4.0", "redis==8.1.0"]
