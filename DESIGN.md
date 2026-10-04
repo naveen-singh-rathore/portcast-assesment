@@ -98,3 +98,32 @@ can be refused while smaller ones keep succeeding (no fairness/queueing).
 - `consume()` = reserve + commit in one call, for work that cannot fail after the check.
 - A reservation is charged to the period it was made in, even if committed after midnight.
 - Redis errors surface as `QuotaUnavailable`; the caller chooses fail-open or fail-closed.
+
+## Demo service and HTTP contract
+
+`service/app.py` is one consumer of the library: a FastAPI app run as 3 replicas behind
+nginx (`docker-compose.yml`). Replicas share nothing but Redis.
+
+| Situation | Status | Body `error` |
+|---|---|---|
+| Success | 200 | — (`tracked`, `remaining`; `replayed: true` on an idempotent retry) |
+| Bad identifier (e.g. org contains `:`) | 400 | `invalid_request` |
+| Feature has no limit for this org | 403 | `feature_not_enabled` |
+| Same `Idempotency-Key` still in progress | 409 | `request_in_progress` |
+| Not enough quota (all-or-nothing) | 429 | `quota_exceeded` (+ `requested`, `remaining`) |
+| Downstream work failed; hold released | 502 | `downstream_failed` |
+| Redis unreachable, feature fails closed | 503 | `quota_unavailable` |
+
+- **Metered flow** (`POST /v1/containers/track`): reserve → do the work → commit, or
+  release on failure. `GET /v1/schedules/search` cannot fail after the check, so it uses
+  one-shot `consume()`.
+- **Fail policy**: closed (503) by default; per feature via `FAIL_OPEN_FEATURES`. Failing
+  open serves unmetered and logs a warning, for features where availability matters more
+  than exact billing.
+- **Commit fails after the work succeeded** (Redis drops between the two calls): the caller
+  gets 503 and the hold expires uncharged. Under-charging is preferred to double work.
+- **Limits** are seeded from `quotas.yaml` with `SET NX`, so a restart never overwrites a
+  limit changed through `PUT /v1/quota/{org}/{feature}`. Production would keep limits in
+  Postgres behind an admin API, writing through to Redis.
+- **Redis socket timeout is 50 ms**: a slow Redis turns into a fast 503 rather than
+  stalling every request.

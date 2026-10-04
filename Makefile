@@ -1,4 +1,4 @@
-.PHONY: install-dev format lint typecheck test check redis-up redis-down
+.PHONY: install-dev format lint typecheck test check redis-up redis-down up down
 
 install-dev:
 	pip install -r requirements-dev.txt
@@ -25,4 +25,11 @@ redis-up:
 	docker compose up -d --wait redis
 
 redis-down:
+	docker compose down -v
+
+# Redis + 3 API replicas + nginx on :8080
+up:
+	docker compose up --build -d --wait
+
+down:
 	docker compose down -v
