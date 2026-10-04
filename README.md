@@ -1,92 +1,163 @@
 # Quota Metering
 
-A per-customer, per-feature monthly quota metering component in Python 3, backed by Redis
-and embedded as an async library in a FastAPI service. Each metered call reserves quota
-atomically in Redis, then commits or releases it. Quota is never over-served and never goes
-negative under concurrent requests, including across multiple service instances.
-
-> Status: initial repository setup. The sections marked TODO are filled in as the code lands.
+Per-customer, per-feature monthly quota metering in Python 3.12, backed by Redis and embedded
+as an async library in a FastAPI service. Each metered request reserves units, does its work,
+then commits or releases them. Quota is never over-served and never goes negative, even when
+many requests hit the same counter at once from several service instances.
 
 ## Quick start
 
-<!-- TODO: single command to bring up the stack and run the load test (docker-compose.yml / Makefile),
-     expected output, and how to tell pass from fail (exit code, audit fields). -->
+Requires Docker with Compose v2.
+
+```bash
+make load    # builds and starts Redis + 3 API replicas + nginx, then runs a 60 s HTTP load test
+make down    # stops the stack and deletes its data
+```
+
+`make load` prints one JSON report. The run **passes** if the command exits 0 and the report
+shows `"over_limit_orgs": 0` and `"granted_vs_used_mismatches": 0`. If either is non-zero, it
+prints `AUDIT FAILED` and exits non-zero. Some `502` responses are expected: the demo
+simulates a 5% downstream failure rate (`DOWNSTREAM_FAILURE_RATE`), and those holds are
+released. The stack stays up on http://localhost:8080 until `make down`.
 
 ## Running tests
 
-<!-- TODO: docker command, local alternative (redis-server + pytest), expected test count,
-     what the concurrency test and the naive control test prove. -->
+```bash
+make redis-up   # Redis 7.4 in Docker on localhost:6379
+make test       # pytest on the host; expect 64 passed
+```
+
+Without Docker: start any Redis on port 6379 (`redis-server`), then run `pytest`. Tests use
+`REDIS_URL` (default `redis://localhost:6379/15`) and **flush that DB**, so never point it at
+real data. `make check` runs black, ruff, mypy and pytest, the same checks CI runs.
+
+`tests/test_concurrency.py` starts 8 OS processes with 50 concurrent requests each against one
+counter, and checks that no more than the limit is ever granted. Its control test runs the
+same load against a naive GET-then-INCRBY version and **requires** that version to
+over-serve. That proves the harness really creates contention.
 
 ## Benchmarks
 
-<!-- TODO: how to run loadtest/bench.py and what it reports. Numbers live in DESIGN.md, not here. -->
+```bash
+make bench   # library only: 4 processes x 32 concurrent loops, 5,000 orgs, 20 s (Redis DB 14, flushed first)
+```
+
+It prints JSON with `throughput_ops_s`, `latency_ms` (p50/p95/p99/max/mean),
+`rejected_requests`, `orgs_touched` and `invariant_violations`. For every org touched it checks
+`granted == used <= limit` and `reserved == 0`, and exits non-zero (`INVARIANT VIOLATED`) if
+any org fails. To run it without Docker: `python -m loadtest.bench --procs 4 --conc 64 --seconds 15`.
+Measured numbers are in [DESIGN.md](DESIGN.md#load-test).
 
 ## How it works
 
-<!-- TODO: library + Redis, one atomic Lua script per operation, reserve -> commit/release,
-     idempotency keys, calendar-month UTC periods in key names. One line per item, each
-     linking to the implementing file. -->
+- Each service instance embeds `QuotaClient` and talks to Redis directly; there is no separate
+  quota service: [quota/client.py](quota/client.py).
+- Every operation (reserve/consume, commit, release, usage) is one Lua script, so the check
+  and the write happen together with nothing in between: [quota/scripts.py](quota/scripts.py).
+- `reserve` holds units for 30 s, then `commit` charges them or `release` returns them. Holds
+  that are never resolved expire, and the next script call on that counter clears them.
+- An `Idempotency-Key` maps a retry to the original reservation, so a retry after a commit
+  is not charged again.
+- Periods are calendar months in UTC ([quota/periods.py](quota/periods.py)). The period id is
+  part of every counter key, so a new month starts on fresh keys and no reset job is needed:
+  [quota/keys.py](quota/keys.py).
+- All keys for one (org, feature) share the hash tag `{org:feature}`, so scripts also work on
+  Redis Cluster.
 
 ## API
 
-<!-- TODO: table of every endpoint in service/app.py: method, path, metered or not, status codes. -->
+Served by [service/app.py](service/app.py). Through nginx, it's on http://localhost:8080.
+
+| Method | Path | Metered | Status codes |
+|---|---|---|---|
+| POST | `/v1/containers/track` | Yes: 1 unit per container; reserve, then commit or release | 200, 400, 403, 409, 422, 429, 502, 503 |
+| GET | `/v1/schedules/search?org=` | Yes: 1 unit, one-shot `consume()` | 200, 400, 403, 422, 429, 503 |
+| GET | `/v1/quota/{org}/{feature}` | No: usage for the current month | 200, 400, 403, 503 |
+| PUT | `/v1/quota/{org}/{feature}` | No: set the limit, body `{"limit": n}` | 200, 400, 422, 503 |
+| GET | `/healthz` | No | 200, 503 |
+
+What each code means:
+- `400`: invalid org or feature id.
+- `403`: no limit is configured for this org and feature.
+- `409`: the same `Idempotency-Key` is still in progress.
+- `422`: the request body or query fails validation.
+- `429`: not enough quota. Batches are all-or-nothing.
+- `502`: the downstream work failed, and the reserved quota was returned.
+- `503`: Redis is unreachable.
+
+A retry of a committed `/track` request returns `200` with `"replayed": true`. `/track`
+responses with status 200 or 502 carry the `X-Quota-Ms` and `X-Instance` headers.
 
 ## Using the library in another service
 
-<!-- TODO: minimal hold() example. -->
+```python
+from redis.asyncio import Redis
+from quota import QuotaClient
+
+quota = QuotaClient(Redis.from_url("redis://localhost:6379/0"))
+
+async def track(org: str, containers: list[str], request_id: str) -> None:
+    async with quota.hold(org, "container-tracking", len(containers), request_id) as res:
+        if res.status == "DUPLICATE":
+            return  # committed by an earlier attempt: don't redo the work
+        await do_tracking(containers)  # returns normally -> commit; raises -> release
+```
+
+`hold()` raises these errors:
+- `QuotaExceeded`: not enough quota. It carries `remaining`.
+- `QuotaNotConfigured`: no limit is set.
+- `DuplicateInFlight`: the same key is still being processed.
+- `QuotaUnavailable`: Redis is unreachable. The caller decides whether to fail open or closed.
 
 ## Configuration
 
-<!-- TODO: every environment variable the service reads, and quotas.yaml seeding (SET NX). -->
+| Variable | Read by | Default | Purpose |
+|---|---|---|---|
+| `REDIS_URL` | service | `redis://localhost:6379/0` | Redis to use; compose sets `redis://redis:6379/0` |
+| `SEED_FILE` | service | unset (no seeding) | Path to `quotas.yaml`; compose sets `/app/quotas.yaml` |
+| `FAIL_OPEN_FEATURES` | service | empty | Comma-separated features that serve unmetered when Redis is down, instead of returning 503 |
+| `DOWNSTREAM_FAILURE_RATE` | service | `0.05` | Share of simulated downstream failures in `/track` |
+| `HOSTNAME` | service | `local` | Instance id returned in `X-Instance` and `/healthz`; set by Docker |
+| `REDIS_URL` | tests / bench | `.../15` / `.../14` | Database that tests and bench **flush** |
+
+**How limits are seeded:** [quotas.yaml](quotas.yaml) sets a `default` limit per feature,
+generates orgs `org-0001` to `org-NNNN` from `orgs.count`, and applies per-org `overrides`.
+At startup the service checks that every limit is an integer >= 0, and fails to start
+otherwise. It then writes each limit with `SET NX`. A restart therefore never overwrites a
+limit that was changed later through `PUT /v1/quota/{org}/{feature}`.
 
 ## Development
 
-Requires Python 3.12+.
-
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-make install-dev      # installs dev tools and the git pre-commit hook
+make install-dev   # dev tools + the git pre-commit hook (black, ruff, mypy, file checks)
+make format        # auto-fix lint issues and reformat
+make check         # what CI runs (.github/workflows/ci.yml), with tests against Redis 7.4
 ```
-
-Tests need Redis; start it with `make redis-up`. Tests use `REDIS_URL` (default
-`redis://localhost:6379/15`) and flush that DB, so never point it at real data.
-
-| Command          | What it does                                          |
-|------------------|-------------------------------------------------------|
-| `make format`    | Auto-fix lint issues (ruff) and format code (black)   |
-| `make lint`      | Check formatting and lint rules without changing files |
-| `make typecheck` | Run mypy in strict mode                               |
-| `make test`      | Run pytest                                            |
-| `make check`     | Run everything CI runs                                |
-
-Code standards, configured in [pyproject.toml](pyproject.toml):
-
-- **black** formats code (line length 100).
-- **ruff** handles linting and import sorting (pycodestyle, pyflakes, isort, bugbear,
-  pyupgrade, simplify, async, ruff rules).
-- **mypy** runs in strict mode. `tests/` and `loadtest/` may leave functions unannotated.
-- **pre-commit** runs the checks above, plus whitespace, YAML/TOML, merge-marker and
-  private-key checks, on every commit. To run it on every file: `pre-commit run --all-files`.
-
-CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on every pull request and on
-every push to `main`. It has two jobs:
-
-1. **Lint**: pre-commit hooks, `black --check`, `ruff check`, `mypy`.
-2. **Tests**: `pytest` against a Redis 7 service container (`REDIS_URL=redis://localhost:6379/0`).
 
 ## Repository layout
 
 ```
-.github/workflows/ci.yml   CI: lint, format, type check, tests
-.pre-commit-config.yaml    Git hooks run on every commit
-.editorconfig              Editor whitespace and indent rules
-pyproject.toml             black, ruff, mypy and pytest configuration
-requirements-dev.txt       Pinned dev and CI tooling
-Makefile                   Development shortcuts
+quota/              the library
+  periods.py        calendar-month UTC periods
+  keys.py           Redis key layout and identifier validation
+  scripts.py        Lua scripts: reserve/consume, commit, release, usage
+  client.py         async QuotaClient, hold(), error types
+service/app.py      FastAPI demo service that uses the library
+loadtest/
+  bench.py          library benchmark with invariant audit
+  loadgen.py        HTTP load generator with client/Redis audit
+tests/              64 tests (unit, real Redis, multi-process, HTTP, audit logic)
+quotas.yaml         seed limits
+docker-compose.yml  Redis, 3 API replicas, nginx; loadgen/bench under profiles
+Dockerfile          multi-stage: api and loadtest images
+nginx.conf          round-robin across the API replicas
+Makefile            up, down, load, bench, redis-up, test, check
+DESIGN.md           decisions, measured numbers, limits
 ```
-
-<!-- TODO: add quota/, service/, tests/, loadtest/, docker-compose.yml, quotas.yaml, requirements.txt. -->
 
 ## Further reading
 
-<!-- TODO: link DESIGN.md (decisions, load-test numbers, limits) and AI_USAGE.md once they exist. -->
+[DESIGN.md](DESIGN.md) explains why the system is built this way. It covers the options that
+were rejected, the concurrency proof, measured load-test numbers, where it falls over, and
+what would change to reach 50,000 orgs.
