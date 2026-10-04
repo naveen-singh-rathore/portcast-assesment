@@ -1,5 +1,6 @@
 """HTTP-level tests: status codes, bodies and quota side effects of each path."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -100,10 +101,56 @@ async def test_retry_with_idempotency_key_is_replayed_not_charged(client):
 
 
 async def test_retry_while_in_flight_is_409(client, quota):
-    await quota.reserve(ORG, svc.TRACKING, 1, idempotency_key="req-2")  # still held
+    # Same key and same body as an attempt that is still held.
+    await quota.reserve(ORG, svc.TRACKING, 1, "req-2", svc.fingerprint(track(1)))
     r = await client.post(TRACK, json=track(1), headers={"Idempotency-Key": "req-2"})
     assert r.status_code == 409
     assert r.json() == {"error": "request_in_progress"}
+    assert r.headers["Retry-After"] == "1"
+
+
+async def test_same_key_different_body_is_422(client):
+    h = {"Idempotency-Key": "req-3"}
+    assert (await client.post(TRACK, json=track(2), headers=h)).status_code == 200
+    r = await client.post(TRACK, json=track(5), headers=h)
+    assert r.status_code == 422
+    assert r.json() == {"error": "idempotency_key_reused"}
+    assert await used(client) == 2
+
+
+async def test_slow_downstream_times_out_and_releases(client, monkeypatch):
+    async def slow(containers):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(svc, "track_downstream", slow)
+    monkeypatch.setattr(svc, "DOWNSTREAM_TIMEOUT_S", 0.05)
+    r = await client.post(TRACK, json=track(4))
+    assert r.status_code == 502
+    u = (await client.get(f"/v1/quota/{ORG}/{svc.TRACKING}")).json()
+    assert (u["used"], u["reserved"]) == (0, 0)
+
+
+async def test_commit_after_expired_hold_is_reported_unmetered(client, quota, clock, monkeypatch):
+    # The work overruns its hold (e.g. a long GC pause) and the capacity is taken.
+    async def overrun(containers):
+        clock.advance(seconds=31)
+        await quota.consume(ORG, svc.TRACKING, 10)
+
+    monkeypatch.setattr(svc, "track_downstream", overrun)
+    r = await client.post(TRACK, json=track(5))
+    assert r.status_code == 200
+    assert r.json() == {"tracked": 5, "metered": False}
+    assert await used(client) == 10  # never above the limit
+
+
+async def test_admin_token_required_when_set(client, monkeypatch):
+    monkeypatch.setattr(svc, "ADMIN_TOKEN", "s3cret")
+    url = f"/v1/quota/{ORG}/{svc.TRACKING}"
+    assert (await client.put(url, json={"limit": 50})).status_code == 401
+    bad = {"Authorization": "Bearer nope"}
+    assert (await client.put(url, json={"limit": 50}, headers=bad)).status_code == 401
+    ok = {"Authorization": "Bearer s3cret"}
+    assert (await client.put(url, json={"limit": 50}, headers=ok)).status_code == 200
 
 
 async def test_redis_down_fails_closed_with_503(client):

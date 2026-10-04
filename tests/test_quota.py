@@ -1,8 +1,20 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from quota import DuplicateInFlight, QuotaExceeded, QuotaNotConfigured
+from quota import (
+    DuplicateInFlight,
+    HoldExpired,
+    IdempotencyKeyReused,
+    QuotaClient,
+    QuotaExceeded,
+    QuotaNotConfigured,
+    QuotaUnavailable,
+    Reservation,
+    period_for,
+)
 
 ORG, FEAT = "acme", "container-tracking"
 
@@ -177,3 +189,110 @@ async def test_lowering_limit_below_usage_never_goes_negative(quota):
     u = await quota.usage(ORG, FEAT)
     assert u.remaining == 0
     assert (await quota.consume(ORG, FEAT, 1)).status == "REJECTED"
+
+
+# ---------- review fixes ----------
+
+
+async def test_commit_of_unknown_reservation_charges_nothing(quota):
+    await quota.set_limit(ORG, FEAT, 100)
+    fake = Reservation(ORG, FEAT, "2026-10", "made-up-id", 40)
+    assert await quota.commit(fake) == ("UNKNOWN", 0)
+    assert (await quota.usage(ORG, FEAT)).used == 0
+
+
+async def test_expired_uncharged_is_not_reported_as_committed(quota, clock):
+    await quota.set_limit(ORG, FEAT, 100)
+    slow = await quota.reserve(ORG, FEAT, 100, idempotency_key="slow")
+    clock.advance(seconds=31)
+    await quota.consume(ORG, FEAT, 100)
+    assert await quota.commit(slow.reservation) == ("EXPIRED_UNCHARGED", 0)
+    assert await quota.commit(slow.reservation) == ("EXPIRED_UNCHARGED", 0)
+    assert await quota.release(slow.reservation) == ("EXPIRED", 0)
+
+
+async def test_hold_raises_when_work_outlives_its_hold(quota, clock):
+    await quota.set_limit(ORG, FEAT, 100)
+    with pytest.raises(HoldExpired):
+        async with quota.hold(ORG, FEAT, 100):
+            clock.advance(seconds=31)  # work overruns the 30 s hold
+            await quota.consume(ORG, FEAT, 100)  # capacity goes to someone else
+    assert (await quota.usage(ORG, FEAT)).used == 100
+
+
+async def test_extend_keeps_a_long_hold_alive(quota, clock):
+    await quota.set_limit(ORG, FEAT, 100)
+    r = await quota.reserve(ORG, FEAT, 60)
+    clock.advance(seconds=20)
+    assert await quota.extend(r.reservation) == "EXTENDED"
+    clock.advance(seconds=20)  # 40 s after reserve, still held
+    assert (await quota.usage(ORG, FEAT)).reserved == 60
+    assert await quota.commit(r.reservation) == ("COMMITTED", 60)
+
+
+async def test_extend_after_expiry_is_refused(quota, clock):
+    await quota.set_limit(ORG, FEAT, 100)
+    r = await quota.reserve(ORG, FEAT, 60)
+    clock.advance(seconds=31)
+    assert await quota.extend(r.reservation) == "NOT_HELD"
+    assert (await quota.usage(ORG, FEAT)).reserved == 0
+
+
+async def test_same_key_different_payload_is_refused(quota):
+    await quota.set_limit(ORG, FEAT, 100)
+    await quota.consume(ORG, FEAT, 5, idempotency_key="k")
+    with pytest.raises(IdempotencyKeyReused):
+        await quota.consume(ORG, FEAT, 50, idempotency_key="k")
+    assert (await quota.usage(ORG, FEAT)).used == 5
+
+
+async def test_duplicate_reports_the_original_units(quota):
+    await quota.set_limit(ORG, FEAT, 100)
+    await quota.reserve(ORG, FEAT, 5, idempotency_key="k", fingerprint="req-body-1")
+    dup = await quota.reserve(ORG, FEAT, 7, idempotency_key="k", fingerprint="req-body-1")
+    assert dup.status == "DUPLICATE" and dup.reservation.units == 5
+
+
+async def test_lost_reserve_reply_does_not_block_the_retry(quota):
+    # The script runs but its reply is lost (socket timeout). The client releases
+    # the hold by id, so a retry with the same key goes through immediately.
+    await quota.set_limit(ORG, FEAT, 100)
+    real = quota._reserve
+
+    async def run_then_time_out(**kw):
+        await real(**kw)
+        raise RedisTimeoutError("reply lost")
+
+    quota._reserve = run_then_time_out
+    with pytest.raises(QuotaUnavailable):
+        await quota.reserve(ORG, FEAT, 5, idempotency_key="k1")
+    quota._reserve = real
+    retry = await quota.reserve(ORG, FEAT, 5, idempotency_key="k1")
+    assert retry.status == "OK"
+    assert (await quota.usage(ORG, FEAT)).reserved == 5
+
+
+async def test_commit_is_retried_once_on_a_transient_error(quota):
+    await quota.set_limit(ORG, FEAT, 100)
+    r = await quota.reserve(ORG, FEAT, 10)
+    real, calls = quota._commit, []
+
+    async def flaky(**kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RedisTimeoutError("blip")
+        return await real(**kw)
+
+    quota._commit = flaky
+    assert await quota.commit(r.reservation) == ("COMMITTED", 10)
+    assert len(calls) == 2
+
+
+async def test_skewed_instance_clock_bills_the_redis_month(redis):
+    # The instance clock is 40 days ahead; Redis time decides the month.
+    real_now = datetime.now(UTC)
+    q = QuotaClient(redis, clock=lambda: real_now + timedelta(days=40), server_time=True)
+    await q.set_limit(ORG, FEAT, 100)
+    await q.consume(ORG, FEAT, 3)
+    u = await q.usage(ORG, FEAT)
+    assert u.period == period_for(real_now).id and u.used == 3

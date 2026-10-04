@@ -1,18 +1,21 @@
-from .client import (
+from .client import QuotaClient, Reservation, ReserveResult, Usage
+from .errors import (
     DuplicateInFlight,
-    QuotaClient,
+    HoldExpired,
+    IdempotencyKeyReused,
+    InvalidInput,
     QuotaError,
     QuotaExceeded,
     QuotaNotConfigured,
     QuotaUnavailable,
-    Reservation,
-    ReserveResult,
-    Usage,
 )
 from .periods import Period, period_for
 
 __all__ = [
     "DuplicateInFlight",
+    "HoldExpired",
+    "IdempotencyKeyReused",
+    "InvalidInput",
     "Period",
     "QuotaClient",
     "QuotaError",
