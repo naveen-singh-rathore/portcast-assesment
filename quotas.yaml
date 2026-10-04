@@ -8,3 +8,11 @@ orgs:
   overrides:
     org-0001:
       container-tracking: 500
+# Optional fixed-window burst limit: at most `units` per `window_s` seconds, on top of
+# the monthly limit. Features without an entry have no burst limit.
+burst:
+  default:
+    container-tracking: {units: 300, window_s: 1}
+  overrides:
+    org-0001:
+      container-tracking: {units: 100, window_s: 1}

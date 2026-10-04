@@ -32,6 +32,19 @@ def test_lost_response_may_or_may_not_have_been_charged() -> None:
     assert audit(outcomes, {"a": (10, 10)})["granted_vs_used_mismatches"] == 1
 
 
+def test_usage_from_before_the_run_is_not_a_mismatch() -> None:
+    # An earlier run this month left 500 used; this run granted 5 more.
+    outcomes = [Outcome("a", 5, succeeded=True)]
+    assert audit(outcomes, {"a": (505, 1000)}, {"a": 500})["granted_vs_used_mismatches"] == 0
+    assert audit(outcomes, {"a": (505, 1000)})["granted_vs_used_mismatches"] == 1  # no baseline
+    assert audit(outcomes, {"a": (509, 1000)}, {"a": 500})["granted_vs_used_mismatches"] == 1
+
+
+def test_over_limit_counts_usage_from_before_the_run() -> None:
+    outcomes = [Outcome("a", 5, succeeded=True)]
+    assert audit(outcomes, {"a": (505, 500)}, {"a": 500})["over_limit_orgs"] == 1
+
+
 def test_unknown_then_succeeded_counts_as_known() -> None:
     o = Outcome("a", 5, succeeded=True, unknown=True)  # first attempt lost, retry replayed
     assert audit([o], {"a": (5, 10)})["granted_vs_used_mismatches"] == 0

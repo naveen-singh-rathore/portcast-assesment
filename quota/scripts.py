@@ -6,7 +6,7 @@ between the read and the write. This is the whole concurrency story.
 
 Every script receives the same KEYS layout (see keys.py):
   KEYS[1] limit   KEYS[2] state   KEYS[3] res   KEYS[4] resunits
-  KEYS[5] done    KEYS[6] idem
+  KEYS[5] done    KEYS[6] idem    KEYS[7] burst KEYS[8] window
 
 Time comes from the Redis server clock (TIME) unless the caller passes one
 (tests do), so hold expiry and the billing month never depend on how well an
@@ -20,8 +20,8 @@ resunits so a late commit can be capped), u expired and could not be charged.
 # Expired reservations are swept by whichever call touches the counter
 # next, so there is no background job that can fall behind or die.
 _PRELUDE = r"""
-local K_LIMIT, K_STATE, K_RES, K_RESUNITS, K_DONE, K_IDEM =
-  KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6]
+local K_LIMIT, K_STATE, K_RES, K_RESUNITS, K_DONE, K_IDEM, K_BURST, K_WIN =
+  KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6], KEYS[7], KEYS[8]
 
 local function num(v) return tonumber(v or '0') or 0 end
 
@@ -69,12 +69,30 @@ local function parse_idem(v)
   local id, u, fp = string.match(v, '^([^|]*)|([^|]*)|(.*)$')
   return id, tonumber(u) or 0, fp or ''
 end
+
+-- Fixed-window burst limit, "units/window_ms" in K_BURST (absent: no limit).
+-- Windows are aligned to the epoch on the Redis clock, so every instance agrees
+-- on where a window starts. K_WIN holds the current window's start and count;
+-- a stored start that differs from now's window means that window is over.
+-- Returns {cap, window_ms, start, used} or nil.
+local function burst_at(now)
+  local cfg = redis.call('GET', K_BURST)
+  if not cfg then return nil end
+  local cap, win = string.match(cfg, '^(%d+)/(%d+)$')
+  cap, win = tonumber(cap), tonumber(win)
+  local start = now - (now % win)
+  local w = redis.call('HMGET', K_WIN, 'start', 'n')
+  local used = 0
+  if tonumber(w[1]) == start then used = num(w[2]) end
+  return {cap, win, start, used}
+end
 """
 
 # ARGV: units, now_ms ('' = server time), ttl_ms, res_id, mode('reserve'|'consume'),
 #       keep_until_ms, idem_ttl_s, has_idem('1'|'0'), fingerprint,
 #       period_start_ms, period_end_ms
 # Returns {status, remaining | server_now, res_id, state, units}
+#   RATE_LIMITED: {status, remaining, '', '', burst_cap, retry_after_ms (-1: never fits)}
 RESERVE = _PRELUDE + r"""
 local units   = tonumber(ARGV[1])
 local now     = now_ms(ARGV[2])
@@ -122,6 +140,15 @@ if units > remaining then
   return {'REJECTED', math.max(remaining, 0), '', '', 0}
 end
 
+-- Burst check, in the same script: a request is admitted only if it fits both
+-- the month and the current window. A batch larger than the whole window can
+-- never fit, so it gets no retry time.
+local b = burst_at(now)
+if b and b[4] + units > b[1] then
+  local retry = (units > b[1]) and -1 or (b[3] + b[2] - now)
+  return {'RATE_LIMITED', remaining, '', '', b[1], retry}
+end
+
 if mode == 'reserve' then
   redis.call('HINCRBY', K_STATE, 'reserved', units)
   redis.call('ZADD', K_RES, now + ttl, res_id)
@@ -132,6 +159,12 @@ else
 end
 if hasidem then
   redis.call('SET', K_IDEM, res_id .. '|' .. units .. '|' .. fp, 'EX', idemttl)
+end
+-- The window counts admitted units. A later release does not refund them: the
+-- window limits how fast work is started, not what is billed.
+if b then
+  redis.call('HSET', K_WIN, 'start', b[3], 'n', b[4] + units)
+  redis.call('PEXPIREAT', K_WIN, b[3] + b[2])
 end
 touch(keep)
 return {'OK', remaining - units, res_id, mode == 'reserve' and 'held' or 'c', units}
@@ -238,7 +271,8 @@ return {'EXTENDED', ''}
 """
 
 # ARGV: now_ms ('' = server time), period_start_ms, period_end_ms
-# Returns {'OK', limit(-1 if unset), used, reserved} or {'WRONG_PERIOD', server_now, 0, 0}
+# Returns {'OK', limit(-1 if unset), used, reserved, burst_cap(-1 if unset),
+#          window_ms, window_used, window_resets_ms} or {'WRONG_PERIOD', server_now, 0, 0}
 USAGE = _PRELUDE + r"""
 local now = now_ms(ARGV[1])
 if now < tonumber(ARGV[2]) or now >= tonumber(ARGV[3]) then
@@ -246,7 +280,9 @@ if now < tonumber(ARGV[2]) or now >= tonumber(ARGV[3]) then
 end
 sweep(now)
 local limit = redis.call('GET', K_LIMIT)
+local b = burst_at(now) or {-1, 0, 0, 0}
 return {'OK', limit and tonumber(limit) or -1,
         num(redis.call('HGET', K_STATE, 'used')),
-        num(redis.call('HGET', K_STATE, 'reserved'))}
+        num(redis.call('HGET', K_STATE, 'reserved')),
+        b[1], b[2], b[4], b[3] + b[2]}
 """

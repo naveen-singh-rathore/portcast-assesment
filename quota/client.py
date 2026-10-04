@@ -31,11 +31,13 @@ from .errors import (
     QuotaExceeded,
     QuotaNotConfigured,
     QuotaUnavailable,
+    RateLimited,
 )
 from .keys import QuotaKeys, keys_for
 from .periods import Period, period_for
 
 __all__ = [
+    "BurstUsage",
     "DuplicateInFlight",
     "HoldExpired",
     "IdempotencyKeyReused",
@@ -45,6 +47,7 @@ __all__ = [
     "QuotaExceeded",
     "QuotaNotConfigured",
     "QuotaUnavailable",
+    "RateLimited",
     "Reservation",
     "ReserveResult",
     "Usage",
@@ -75,14 +78,37 @@ class Reservation:
 
 @dataclass(frozen=True)
 class ReserveResult:
-    status: str  # OK | DUPLICATE | REJECTED
+    status: str  # OK | DUPLICATE | REJECTED | RATE_LIMITED
     remaining: int
     reservation: Reservation | None
     state: str  # held | c | '' (for DUPLICATE: state of the original)
+    burst_limit: int = 0  # RATE_LIMITED only: units allowed per window
+    retry_after_ms: int = 0  # RATE_LIMITED only: until the window resets; -1 = never fits
 
     @property
     def granted(self) -> bool:
         return self.status in ("OK", "DUPLICATE")
+
+    def rate_limited(self, org: str, feature: str, units: int) -> RateLimited:
+        retry = None if self.retry_after_ms < 0 else self.retry_after_ms / 1000
+        return RateLimited(org, feature, units, self.burst_limit, retry)
+
+
+@dataclass(frozen=True)
+class BurstUsage:
+    limit: int  # units per window
+    window: timedelta
+    used: int  # units admitted in the current window
+    resets_at: datetime
+
+    def as_dict(self) -> dict[str, str | int | float]:
+        return {
+            "limit": self.limit,
+            "window_s": self.window.total_seconds(),
+            "used": self.used,
+            "remaining": max(self.limit - self.used, 0),
+            "resets_at": self.resets_at.isoformat(),
+        }
 
 
 @dataclass(frozen=True)
@@ -96,8 +122,9 @@ class Usage:
     remaining: int
     period_start: datetime
     resets_at: datetime
+    burst: BurstUsage | None = None
 
-    def as_dict(self) -> dict[str, str | int]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "org": self.org,
             "feature": self.feature,
@@ -108,6 +135,7 @@ class Usage:
             "remaining": self.remaining,
             "period_start": self.period_start.isoformat(),
             "resets_at": self.resets_at.isoformat(),
+            "burst": self.burst.as_dict() if self.burst else None,
         }
 
 
@@ -193,6 +221,24 @@ class QuotaClient:
         except RedisError as e:
             raise QuotaUnavailable(str(e)) from e
 
+    async def set_burst_limit(self, org: str, feature: str, units: int, window: timedelta) -> None:
+        """Allow at most `units` per fixed `window`, on top of the monthly limit."""
+        window_ms = int(window.total_seconds() * 1000)
+        if units < 0 or window_ms < 1:
+            raise InvalidInput("burst units must be >= 0 and window >= 1 ms")
+        k = keys_for(org, feature, "_")
+        try:
+            await self._r.set(k.burst, f"{units}/{window_ms}")
+        except RedisError as e:
+            raise QuotaUnavailable(str(e)) from e
+
+    async def clear_burst_limit(self, org: str, feature: str) -> None:
+        k = keys_for(org, feature, "_")
+        try:
+            await self._r.delete(k.burst, k.window)
+        except RedisError as e:
+            raise QuotaUnavailable(str(e)) from e
+
     # -- operations -------------------------------------------------------
     async def _acquire(
         self,
@@ -246,6 +292,8 @@ class QuotaClient:
             raise QuotaNotConfigured(f"no quota configured for {org}/{feature}")
         if status == "MISMATCH":
             raise IdempotencyKeyReused(idempotency_key or "")
+        if status == "RATE_LIMITED":
+            return ReserveResult(status, remaining, None, "", held_units, int(raw[5]))
         res = Reservation(org, feature, period.id, res_id, held_units) if res_id else None
         return ReserveResult(status, remaining, res, state)
 
@@ -349,6 +397,15 @@ class QuotaClient:
         limit, used, reserved = int(raw[1]), int(raw[2]), int(raw[3])
         if limit < 0:
             raise QuotaNotConfigured(f"no quota configured for {org}/{feature}")
+        burst_cap, window_ms, window_used, window_end_ms = (int(v) for v in raw[4:8])
+        burst = None
+        if burst_cap >= 0:
+            burst = BurstUsage(
+                burst_cap,
+                timedelta(milliseconds=window_ms),
+                window_used,
+                datetime.fromtimestamp(window_end_ms / 1000, UTC),
+            )
         return Usage(
             org,
             feature,
@@ -359,6 +416,7 @@ class QuotaClient:
             max(limit - used - reserved, 0),
             period.start,
             period.end,
+            burst,
         )
 
     @asynccontextmanager
@@ -381,6 +439,8 @@ class QuotaClient:
         res = await self.reserve(org, feature, units, idempotency_key, fingerprint)
         if res.status == "REJECTED":
             raise QuotaExceeded(org, feature, units, res.remaining)
+        if res.status == "RATE_LIMITED":
+            raise res.rate_limited(org, feature, units)
         if res.status == "DUPLICATE":
             if res.state == "held":
                 raise DuplicateInFlight(idempotency_key or "")

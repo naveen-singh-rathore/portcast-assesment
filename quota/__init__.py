@@ -1,4 +1,4 @@
-from .client import QuotaClient, Reservation, ReserveResult, Usage
+from .client import BurstUsage, QuotaClient, Reservation, ReserveResult, Usage
 from .errors import (
     DuplicateInFlight,
     HoldExpired,
@@ -8,10 +8,12 @@ from .errors import (
     QuotaExceeded,
     QuotaNotConfigured,
     QuotaUnavailable,
+    RateLimited,
 )
 from .periods import Period, period_for
 
 __all__ = [
+    "BurstUsage",
     "DuplicateInFlight",
     "HoldExpired",
     "IdempotencyKeyReused",
@@ -22,6 +24,7 @@ __all__ = [
     "QuotaExceeded",
     "QuotaNotConfigured",
     "QuotaUnavailable",
+    "RateLimited",
     "Reservation",
     "ReserveResult",
     "Usage",

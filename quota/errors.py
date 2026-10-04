@@ -22,6 +22,23 @@ class QuotaExceeded(QuotaError):
         self.requested, self.remaining = requested, remaining
 
 
+class RateLimited(QuotaError):
+    """The request does not fit the current burst window (the monthly quota may still).
+
+    retry_after_s is when the window resets, or None if the batch is larger than a
+    whole window allows and can never fit: split it instead of retrying.
+    """
+
+    def __init__(
+        self, org: str, feature: str, requested: int, burst_limit: int, retry_after_s: float | None
+    ) -> None:
+        super().__init__(
+            f"{org}/{feature}: requested {requested}, burst limit {burst_limit} per window"
+        )
+        self.org, self.feature = org, feature
+        self.requested, self.burst_limit, self.retry_after_s = requested, burst_limit, retry_after_s
+
+
 class QuotaNotConfigured(QuotaError):
     pass
 

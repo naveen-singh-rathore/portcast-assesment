@@ -17,6 +17,8 @@ def test_layout() -> None:
     assert k.resunits == "q:{org-1:container-tracking}:2026-10:resunits"
     assert k.done == "q:{org-1:container-tracking}:2026-10:done"
     assert k.idem("abc") == "q:{org-1:container-tracking}:idem:abc"
+    assert k.burst == "q:{org-1:container-tracking}:burst"
+    assert k.window == "q:{org-1:container-tracking}:win"
 
 
 def test_all_keys_share_one_hash_tag() -> None:
@@ -51,8 +53,17 @@ def test_different_orgs_and_features_do_not_collide() -> None:
 
 def test_script_keys_order_and_placeholder() -> None:
     k = keys_for("o", "f", "2026-10")
-    assert k.all_for_script() == [k.limit, k.state, k.res, k.resunits, k.done, k.idem("_none")]
-    assert k.all_for_script("x")[-1] == k.idem("x")
+    assert k.all_for_script() == [
+        k.limit,
+        k.state,
+        k.res,
+        k.resunits,
+        k.done,
+        k.idem("_none"),
+        k.burst,
+        k.window,
+    ]
+    assert k.all_for_script("x")[5] == k.idem("x")
 
 
 @pytest.mark.parametrize("bad", ["", "a{b", "a}b", "a:b", "a|b", "a b"])
