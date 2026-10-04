@@ -27,3 +27,5 @@ repos:
     rev: v2.4.0
     hooks:
       - id: mypy
+        # The hook runs in an isolated env; list imported third-party packages here.
+        additional_dependencies: ["pytest==9.1.1"]
