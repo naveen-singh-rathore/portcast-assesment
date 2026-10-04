@@ -8,8 +8,8 @@ all atomically.
   q:{org:feat}:<period>           HASH    used, reserved
   q:{org:feat}:<period>:res       ZSET    reservation_id -> expires_at_ms
   q:{org:feat}:<period>:resunits  HASH    reservation_id -> units
-  q:{org:feat}:<period>:done      HASH    reservation_id -> c | r | x
-  q:{org:feat}:idem:<key>         STRING  cached success for an idempotency key (1 h TTL)
+  q:{org:feat}:<period>:done      HASH    reservation_id -> c | r | x | u
+  q:{org:feat}:idem:<key>         STRING  "reservation_id|units|fingerprint" (1 h TTL)
 
 Identifiers may not contain "{", "}" (would break the hash tag), ":" (the
 separator inside the tag), "|" (the reservation token separator) or spaces.
@@ -19,13 +19,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .errors import InvalidInput
+
 _FORBIDDEN = frozenset("{}:| ")
 
 
 def _tag(org: str, feature: str) -> str:
     for part in (org, feature):
         if not part or any(c in _FORBIDDEN for c in part):
-            raise ValueError(f"invalid identifier: {part!r}")
+            raise InvalidInput(f"invalid identifier: {part!r}")
     return f"q:{{{org}:{feature}}}"
 
 
