@@ -127,3 +127,58 @@ nginx (`docker-compose.yml`). Replicas share nothing but Redis.
   Postgres behind an admin API, writing through to Redis.
 - **Redis socket timeout is 50 ms**: a slow Redis turns into a fast 503 rather than
   stalling every request.
+
+## Load test
+
+Two tools, both ending in a correctness audit, so a fast-but-wrong run fails:
+
+- `loadtest/bench.py` (`make bench`): the library alone. N processes × M concurrent loops,
+  skewed bursty traffic (20% of orgs get 80% of requests). Audit per org touched:
+  `granted == used <= limit` and `reserved == 0`.
+- `loadtest/loadgen.py` (`make load`): HTTP through nginx to 3 replicas, bursty per org,
+  5% downstream failures, client retries reusing the `Idempotency-Key` (always on a lost
+  response, plus 5% of delivered ones). Audit per org touched: `used <= limit`, and
+  `used` equals units clients were told succeeded. A request whose every attempt died in
+  transit has an unknown outcome, so `used` may lie anywhere in
+  `[known, known + unknown]`; anything outside that range fails the run.
+
+Measured on an Apple M3 laptop (8 cores: 4 performance + 4 efficiency, 8 GB RAM, macOS 26.5)
+with Docker Desktop 28.1.1 limited to 8 CPUs and 4 GiB. Redis, the 3 API replicas, nginx and
+the load generators all ran on that one machine:
+
+| Test | Result |
+|---|---|
+| Redis server time per script (`INFO commandstats`, `usec_per_call` for evalsha) | 12.74 µs per `EVALSHA` (1,156,656 calls over both runs) |
+| Library, `make bench` (4 procs × 32 conc, 5,000 orgs) | 56,354 ops/s; p50 2.136 ms, p99 4.714 ms; 0 invariant violations across 4,992 orgs. No request was rejected: the 20,000 per-org limit was never reached, so this measures the grant path only |
+| HTTP, `make load` (3 replicas, target 300 req/s, 60 s) | 250 req/s achieved (target 300; see "The load generator itself" below); quota overhead p50 0.539 ms, p99 1.521 ms (end to end p50 9.46 ms, p99 15.22 ms); 200: 14,260, 502: 706 (simulated downstream failures), 429: 47; audit passed: 0 over-limit and 0 mismatches across 200 orgs, 0 unknown-outcome units |
+
+## Where it falls over
+
+- **Single Redis node:** scripts run serially; at 12.74 µs each one node is
+  bounded at roughly 78,492 ops/s. Beyond that, or for HA, use Redis
+  Cluster (keys are already hash-tagged per org+feature).
+- **Redis failure:** with AOF `everysec`, a crash can lose ~1 s of deductions (under-count,
+  never over-serve beyond that window). Failover to a replica can lose un-replicated writes
+  the same way. Fail-closed by default (503), configurable per feature.
+- **Clock skew:** periods and hold expiry use the instance clock (NTP). A few seconds of skew
+  can put a request at the month boundary in the neighbouring period or expire holds early/late.
+- **Idempotency window is 1 hour:** a later retry is treated as a new request. At 2k keyed
+  req/s a 24 h window is ~170M keys; 1 h is ~7M.
+- **Idempotency across a month boundary:** a committed key retried next month is not
+  recognised (its done-marker lives in last month's keys).
+- **Hot single counter:** all ops for one (org, feature) serialise on one slot.
+- **Sweep is bounded:** at most 100 expired holds cleared per call; after a mass crash the
+  rest clear on later calls (expiry stays correct; reporting lags slightly).
+- **The load generator itself:** one Python process; if achieved rps is below target, the
+  client is the bottleneck, not the service.
+
+## Getting to 50,000 orgs
+
+Memory is not the issue (~1.5M counters, a few hundred MB). What changes:
+1. Redis Cluster (3+ primaries with replicas); the `{org:feature}` hash tag already makes it
+   cluster-safe.
+2. Limits in Postgres with write-through + a small in-process cache.
+3. Async usage-event stream (Redis Stream or Kafka) into Postgres for audit, reconciliation
+   after a Redis loss, and billing.
+4. Metrics: per-script latency, rejection rate, expired-hold rate, fail-open count.
+5. Load test on production-like hardware with a distributed generator (k6/Locust).
