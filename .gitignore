@@ -218,3 +218,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Project-specific ---
+
+# Local environment files (never commit secrets)
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Redis persistence files from running redis-server locally
+dump.rdb
+appendonly.aof
+appendonlydir/
+
+# Load-test and benchmark output
+loadtest/results/
+*.prof
