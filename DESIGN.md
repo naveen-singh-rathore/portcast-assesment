@@ -5,7 +5,7 @@
 "Monthly" means calendar month, UTC. A period is identified by `YYYY-MM`: it starts at
 00:00 UTC on the 1st and ends (exclusive) at 00:00 UTC on the 1st of the next month.
 
-The period id will be part of every counter key, so a new month writes to new keys:
+The period id is part of every counter key, so a new month writes to new keys:
 there is no reset job, so nothing can run late or run twice.
 
 Naive datetimes are rejected rather than assumed UTC: a wrong guess near midnight on the
@@ -23,7 +23,8 @@ touches is in one slot and the script stays atomic and cluster-safe without chan
 
 - The limit key has no period: it is configuration, not usage.
 - Usage, holds and done-markers are period-scoped, so a new month starts on fresh keys.
-- Idempotency keys are not period-scoped and live 1 hour. Consequence: a committed request
+- Idempotency keys are not period-scoped and live 1 hour. Each stores the reservation id,
+  its units and a fingerprint of the request payload. Consequence: a committed request
   retried after the month boundary is not recognised as a duplicate (accepted; see limits).
 - Org and feature ids are validated: `{`, `}`, `:`, `|` and spaces are rejected, because
   they would break the hash tag, the tag separator or the reservation token format.
@@ -34,7 +35,8 @@ point (it gives atomicity), and it scales across orgs, but one hot counter canno
 ## Integration shape: in-process library + Redis
 
 Each service instance embeds `QuotaClient` (`quota/client.py`) and talks to Redis directly.
-One quota operation = one `EVALSHA` round trip.
+One quota operation = one `EVALSHA` round trip (plus a one-off `SCRIPT LOAD` the first time a
+connection uses each script: 82 in the first load test).
 
 Rejected: a separate quota microservice. It adds a network hop and a fleet to scale and
 operate, for no correctness gain: correctness comes from Redis atomicity, not from
@@ -80,6 +82,49 @@ into many. Callers that can split work can retry with `remaining` units. Cost: a
 can be refused while smaller ones keep succeeding (no fairness/queueing).
 `commit(actual_units)` covers the opposite case: reserve 100, find 3 invalid, charge 97.
 
+## Burst limit: fixed window per (org, feature)
+
+The monthly limit alone lets one org spend its whole month in a few seconds and starve
+everyone else on the shared fleet. So each (org, feature) can also have an optional burst
+limit: at most `units` per `window` (e.g. 300 containers per 1 s), set in `quotas.yaml`
+under `burst:` or with `PUT /v1/quota/{org}/{feature}/burst`. No entry means no limit.
+
+- **Same script, same atomicity.** The window check runs inside `RESERVE`, after the
+  monthly check and before any write. A request is admitted only if it fits both; if
+  either fails nothing is written. All-or-nothing applies to the window too.
+- **Which reason wins:** if the month is exhausted the caller gets `quota_exceeded`, since
+  waiting for the window would not help. Otherwise `rate_limited` with the time until the
+  window resets (HTTP `429` + `Retry-After`).
+- **Windows are aligned to the epoch on the Redis clock** (`start = now - now % window`), so
+  every instance agrees where a window starts without coordinating.
+- **State is one small hash** `q:{org:feat}:win` = `{start, n}` that expires at the window
+  end. A stored `start` that differs from the current window means it is stale and counts
+  as 0, so no reset job is needed, as with months. Both keys share the `{org:feature}` hash
+  tag, so this stays cluster-safe.
+- **The window counts admissions.** A `release` gives the units back to the month but not
+  to the window: the window limits how fast work is started, and released work was
+  started. An idempotent replay (`DUPLICATE`) is answered before the window check and
+  uses no window capacity.
+- **A batch larger than a whole window** can never fit. It gets `rate_limited` with no
+  `Retry-After` (`retry_after_s: null`), so the caller splits it instead of retrying.
+
+| Option | Why not chosen |
+|---|---|
+| Sliding log (ZSET of timestamps) | Exact, but one entry per request: memory and time grow with traffic |
+| Sliding window counter (weighted previous + current) | Smooths the boundary, but it is an estimate, and a cap that is "about N" is harder to explain and test |
+| Token bucket | Smooth refill, but needs fractional state and a refill rate as well as a size; overkill for "N per window" |
+| Fixed window (chosen) | One counter, O(1), exact within a window, easy to reason about and to show on `GET /v1/quota` |
+
+Cost of fixed windows: an org can send `units` at the very end of one window and `units`
+again at the start of the next, so the worst case over any window-length span is **2×** the
+limit. That is acceptable for load protection. If it is not, the sliding window counter is
+the next step and fits in the same script.
+
+Proof: `tests/test_concurrency.py` runs 8 processes × 50 requests into one window (workers
+pin the clock so the run cannot straddle a boundary). With a window of 60 and a month of
+1,000, exactly 60 are granted. With mixed batches against a window of 200,
+`granted == used == window count <= 200`. `tests/test_burst.py` covers the rules above.
+
 ## Failure and retries: reserve → commit / release, idempotency keys
 
 - `reserve` holds units (counted against remaining) with a 30 s TTL.
@@ -88,15 +133,28 @@ can be refused while smaller ones keep succeeding (no fairness/queueing).
 - Instance dies mid-request → nobody commits; the hold expires. Expiry is **lazy**: every
   script first sweeps expired holds for that counter (max 100 per call). No background job
   to fall behind or die.
-- Late commit after expiry (work outlived TTL): charge only if capacity is still free,
-  otherwise `EXPIRED_UNCHARGED`. We prefer under-charging to over-serving.
-- `commit`/`release` are idempotent (per-reservation `done` marker: c / r / x).
-- Client retries: an idempotency key maps to the reservation. Retry while held →
-  `DuplicateInFlight`. Retry after commit → `DUPLICATE`, not charged. Retry after
+- Late commit after expiry (work outlived TTL): charge only if capacity is still free
+  (`LATE_COMMITTED`), otherwise `EXPIRED_UNCHARGED`. We prefer under-charging to
+  over-serving the counter. `hold()` raises `HoldExpired` in the second case, so the caller
+  knows the work was served but not charged. Work that may outlast the TTL calls
+  `extend()` to renew its hold; the demo service instead caps downstream time at 10 s.
+- `commit`/`release` are idempotent (per-reservation `done` marker: c committed,
+  r released, x expired, u expired and uncharged), so the client retries each once on a
+  Redis error. A commit for an id this counter never issued returns `UNKNOWN` and charges
+  nothing.
+- Client retries: an idempotency key maps to the reservation and a fingerprint of the
+  payload. Retry while held → `DuplicateInFlight` (`hold()` and `/track`; `consume()`
+  never leaves a hold). Retry after commit → `DUPLICATE`, not charged, reporting the
+  original units. Same key with a different payload → `IdempotencyKeyReused`. Retry after
   release/expiry → a fresh attempt (the first left no charge). Works across instances
   because the key lives in Redis.
+- Lost reply: if a reserve times out, the script may still have run. The client releases
+  that reservation by its id (best effort), so a retry is not blocked by an orphaned hold.
 - `consume()` = reserve + commit in one call, for work that cannot fail after the check.
 - A reservation is charged to the period it was made in, even if committed after midnight.
+- Time comes from the Redis server clock inside every script (`TIME`), for hold expiry and
+  for the billing month: an instance whose clock is wrong is told the real time and
+  retries against the right month's keys. Tests inject a clock instead.
 - Redis errors surface as `QuotaUnavailable`; the caller chooses fail-open or fail-closed.
 
 ## Demo service and HTTP contract
@@ -108,9 +166,13 @@ nginx (`docker-compose.yml`). Replicas share nothing but Redis.
 |---|---|---|
 | Success | 200 | — (`tracked`, `remaining`; `replayed: true` on an idempotent retry) |
 | Bad identifier (e.g. org contains `:`) | 400 | `invalid_request` |
+| `PUT` without the admin token, when `ADMIN_TOKEN` is set | 401 | `unauthorized` |
 | Feature has no limit for this org | 403 | `feature_not_enabled` |
-| Same `Idempotency-Key` still in progress | 409 | `request_in_progress` |
+| Same `Idempotency-Key` still in progress (`/track` only), with `Retry-After: 1` | 409 | `request_in_progress` |
+| Body fails validation (e.g. more than 1,000 containers) | 422 | FastAPI's `detail` |
+| Same `Idempotency-Key` reused with a different body | 422 | `idempotency_key_reused` |
 | Not enough quota (all-or-nothing) | 429 | `quota_exceeded` (+ `requested`, `remaining`) |
+| Burst window full; `Retry-After` unless the batch is larger than the whole window | 429 | `rate_limited` (+ `requested`, `burst_limit`, `retry_after_s`) |
 | Downstream work failed; hold released | 502 | `downstream_failed` |
 | Redis unreachable, feature fails closed | 503 | `quota_unavailable` |
 
@@ -120,13 +182,20 @@ nginx (`docker-compose.yml`). Replicas share nothing but Redis.
 - **Fail policy**: closed (503) by default; per feature via `FAIL_OPEN_FEATURES`. Failing
   open serves unmetered and logs a warning, for features where availability matters more
   than exact billing.
-- **Commit fails after the work succeeded** (Redis drops between the two calls): the caller
-  gets 503 and the hold expires uncharged. Under-charging is preferred to double work.
+- **Downstream time is capped** at `DOWNSTREAM_TIMEOUT_S` (10 s, checked at startup to
+  leave 5 s of the 30 s hold). A timeout counts as a failure: the hold is released and the
+  caller gets 502. So work cannot finish after its hold expired; if it ever does (a long
+  process pause), the response says `metered: false` and an error is logged.
+- **Commit fails after the work succeeded**: the library retries the commit once. If Redis
+  is still unreachable the caller gets 503. The commit may or may not have landed (a
+  timeout can fire after the script ran); a retry with the same `Idempotency-Key` replays
+  if it did, and does the work again if it did not.
 - **Limits** are seeded from `quotas.yaml` with `SET NX`, so a restart never overwrites a
   limit changed through `PUT /v1/quota/{org}/{feature}`. Production would keep limits in
   Postgres behind an admin API, writing through to Redis.
 - **Redis socket timeout is 50 ms**: a slow Redis turns into a fast 503 rather than
-  stalling every request.
+  stalling every request. Ambiguous outcomes from it are handled as above.
+- **Admin endpoint**: open in the demo; set `ADMIN_TOKEN` to require a bearer token.
 
 ## Load test
 
@@ -138,7 +207,9 @@ Two tools, both ending in a correctness audit, so a fast-but-wrong run fails:
 - `loadtest/loadgen.py` (`make load`): HTTP through nginx to 3 replicas, bursty per org,
   5% downstream failures, client retries reusing the `Idempotency-Key` (always on a lost
   response, plus 5% of delivered ones). Audit per org touched: `used <= limit`, and
-  `used` equals units clients were told succeeded. A request whose every attempt died in
+  the growth in `used` during the run (usage is snapshotted
+  first, so data from earlier runs in the month does not count) equals units clients were
+  told succeeded. A request whose every attempt died in
   transit has an unknown outcome, so `used` may lie anywhere in
   `[known, known + unknown]`; anything outside that range fails the run.
 
@@ -148,29 +219,38 @@ the load generators all ran on that one machine:
 
 | Test | Result |
 |---|---|
-| Redis server time per script (`INFO commandstats`, `usec_per_call` for evalsha) | 12.74 µs per `EVALSHA` (1,156,656 calls over both runs) |
-| Library, `make bench` (4 procs × 32 conc, 5,000 orgs) | 56,354 ops/s; p50 2.136 ms, p99 4.714 ms; 0 invariant violations across 4,992 orgs. No request was rejected: the 20,000 per-org limit was never reached, so this measures the grant path only |
-| HTTP, `make load` (3 replicas, target 300 req/s, 60 s) | 250 req/s achieved (target 300; see "The load generator itself" below); quota overhead p50 0.539 ms, p99 1.521 ms (end to end p50 9.46 ms, p99 15.22 ms); 200: 14,260, 502: 706 (simulated downstream failures), 429: 47; audit passed: 0 over-limit and 0 mismatches across 200 orgs, 0 unknown-outcome units |
+| Redis server time per script (`INFO commandstats`, `usec_per_call` for evalsha) | 13.71 µs per `EVALSHA` (1,103,722 calls over bench + load). An A/B run of the same workload, 3 rounds each, measured the scripts at about 1.5 µs more than before the Redis-clock and period-check change (13.3 → 14.8 µs), about 1 µs of it the `TIME` call |
+| Library, `make bench` (4 procs × 32 conc, 5,000 orgs) | 53,707 ops/s; p50 2.278 ms, p99 4.822 ms; 0 invariant violations across 4,985 orgs. Earlier runs before that change gave 56,354 and 56,989 ops/s. The gap is within run-to-run noise (one version alone varied 15% across rounds), and the bench is limited by its Python client processes rather than Redis, so the 1.5 µs barely registers. No request was rejected: the 20,000 per-org limit was not reached, so this measures the grant path |
+| HTTP, `make load` (3 replicas, target 300 req/s, 60 s) | 251 req/s achieved (target 300); quota overhead p50 0.563 ms, p99 1.161 ms (end to end p50 9.34 ms, p99 14.78 ms); 200: 14,290, 502: 713 (simulated downstream failures), 429: 53; audit passed: 0 over-limit and 0 mismatches across 200 orgs, 0 unknown-outcome units |
+| HTTP with faults (same load; SIGKILL one API replica at 15 s, `docker compose restart redis` at 30 s) | 241 req/s; 200: 13,587, 502: 709, 503: 109 (fail closed while Redis restarted), 429: 91. The killed replica stopped at 1,141 requests and the other two took its traffic. Audit passed: 0 over-limit, 0 mismatches, 0 unknown-outcome units. The Redis restart was graceful (AOF flushed on shutdown); a hard Redis crash was not tested |
 
 ## Where it falls over
 
-- **Single Redis node:** scripts run serially; at 12.74 µs each one node is
-  bounded at roughly 78,492 ops/s. Beyond that, or for HA, use Redis
+- **Single Redis node:** scripts run serially; at 13.71 µs each one node is
+  bounded at roughly 72,939 ops/s (computed, not measured: no run pushed Redis that far). Beyond that, or for HA, use Redis
   Cluster (keys are already hash-tagged per org+feature).
-- **Redis failure:** with AOF `everysec`, a crash can lose ~1 s of deductions (under-count,
-  never over-serve beyond that window). Failover to a replica can lose un-replicated writes
-  the same way. Fail-closed by default (503), configurable per feature.
-- **Clock skew:** periods and hold expiry use the instance clock (NTP). A few seconds of skew
-  can put a request at the month boundary in the neighbouring period or expire holds early/late.
+- **Redis failure:** with AOF `everysec`, a crash can lose ~1 s of deductions. Redis then
+  believes less was used, so it **can over-serve by up to that ~1 s of traffic**. Failover to
+  a replica can lose un-replicated writes the same way. Closing that gap needs an event log
+  (see below) to reconcile from. Fail-closed by default (503), configurable per feature.
+- **Clock skew:** hold expiry and the billing month use the Redis server clock, so instance
+  skew no longer matters. A Redis failover to a node whose clock differs would still shift
+  both by that difference.
+- **Exactly-once is bounded by the hold:** a retry after a hold expired, while the original
+  is somehow still working, starts a second attempt. The 10 s downstream cap (or `extend()`)
+  is what keeps the original from outliving its hold.
 - **Idempotency window is 1 hour:** a later retry is treated as a new request. At 2k keyed
   req/s a 24 h window is ~170M keys; 1 h is ~7M.
 - **Idempotency across a month boundary:** a committed key retried next month is not
   recognised (its done-marker lives in last month's keys).
 - **Hot single counter:** all ops for one (org, feature) serialise on one slot.
-- **Sweep is bounded:** at most 100 expired holds cleared per call; after a mass crash the
-  rest clear on later calls (expiry stays correct; reporting lags slightly).
-- **The load generator itself:** one Python process; if achieved rps is below target, the
-  client is the bottleneck, not the service.
+- **Fixed-window boundary:** up to 2× the burst limit can be admitted across two adjacent
+  windows (see Burst limit).
+- **Sweep is bounded:** at most 100 expired holds cleared per call. After a mass crash,
+  `reserved` stays too high until later calls clear the rest, so some requests may be
+  rejected that should have been granted (under-serving, never over-serving).
+- **The load generator itself:** one Python process. Runs reached ~250 of 300 req/s
+  target; the cause was not measured, but Python's sleep-based pacing is the likely limit.
 
 ## Getting to 50,000 orgs
 

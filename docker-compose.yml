@@ -20,7 +20,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       SEED_FILE: /app/quotas.yaml
       DOWNSTREAM_FAILURE_RATE: "0.05"
+      DOWNSTREAM_TIMEOUT_S: "10"   # must leave 5 s of the 30 s hold
       FAIL_OPEN_FEATURES: ""
+      ADMIN_TOKEN: ""              # set to require "Authorization: Bearer <token>" on PUT
     deploy:
       replicas: 3
     depends_on:

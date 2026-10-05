@@ -37,7 +37,8 @@ down:
 # Full stack + 60 s HTTP load test; exits non-zero if the audit fails
 load:
 	docker compose up --build -d --wait
-	docker compose --profile load run --rm --build loadgen
+	docker compose --profile load build loadgen
+	docker compose --profile load run --rm --no-deps loadgen
 
 # Library-only latency/throughput + invariant audit
 bench:

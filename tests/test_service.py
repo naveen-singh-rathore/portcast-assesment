@@ -1,6 +1,8 @@
 """HTTP-level tests: status codes, bodies and quota side effects of each path."""
 
+import asyncio
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -100,10 +102,56 @@ async def test_retry_with_idempotency_key_is_replayed_not_charged(client):
 
 
 async def test_retry_while_in_flight_is_409(client, quota):
-    await quota.reserve(ORG, svc.TRACKING, 1, idempotency_key="req-2")  # still held
+    # Same key and same body as an attempt that is still held.
+    await quota.reserve(ORG, svc.TRACKING, 1, "req-2", svc.fingerprint(track(1)))
     r = await client.post(TRACK, json=track(1), headers={"Idempotency-Key": "req-2"})
     assert r.status_code == 409
     assert r.json() == {"error": "request_in_progress"}
+    assert r.headers["Retry-After"] == "1"
+
+
+async def test_same_key_different_body_is_422(client):
+    h = {"Idempotency-Key": "req-3"}
+    assert (await client.post(TRACK, json=track(2), headers=h)).status_code == 200
+    r = await client.post(TRACK, json=track(5), headers=h)
+    assert r.status_code == 422
+    assert r.json() == {"error": "idempotency_key_reused"}
+    assert await used(client) == 2
+
+
+async def test_slow_downstream_times_out_and_releases(client, monkeypatch):
+    async def slow(containers):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(svc, "track_downstream", slow)
+    monkeypatch.setattr(svc, "DOWNSTREAM_TIMEOUT_S", 0.05)
+    r = await client.post(TRACK, json=track(4))
+    assert r.status_code == 502
+    u = (await client.get(f"/v1/quota/{ORG}/{svc.TRACKING}")).json()
+    assert (u["used"], u["reserved"]) == (0, 0)
+
+
+async def test_commit_after_expired_hold_is_reported_unmetered(client, quota, clock, monkeypatch):
+    # The work overruns its hold (e.g. a long GC pause) and the capacity is taken.
+    async def overrun(containers):
+        clock.advance(seconds=31)
+        await quota.consume(ORG, svc.TRACKING, 10)
+
+    monkeypatch.setattr(svc, "track_downstream", overrun)
+    r = await client.post(TRACK, json=track(5))
+    assert r.status_code == 200
+    assert r.json() == {"tracked": 5, "metered": False}
+    assert await used(client) == 10  # never above the limit
+
+
+async def test_admin_token_required_when_set(client, monkeypatch):
+    monkeypatch.setattr(svc, "ADMIN_TOKEN", "s3cret")
+    url = f"/v1/quota/{ORG}/{svc.TRACKING}"
+    assert (await client.put(url, json={"limit": 50})).status_code == 401
+    bad = {"Authorization": "Bearer nope"}
+    assert (await client.put(url, json={"limit": 50}, headers=bad)).status_code == 401
+    ok = {"Authorization": "Bearer s3cret"}
+    assert (await client.put(url, json={"limit": 50}, headers=ok)).status_code == 200
 
 
 async def test_redis_down_fails_closed_with_503(client):
@@ -138,6 +186,63 @@ async def test_admin_put_limit_and_usage_report(client):
     assert body["resets_at"] == "2026-11-01T00:00:00+00:00"
 
 
+async def test_burst_exceeded_is_429_rate_limited_with_retry_after(client, clock):
+    r = await client.put(f"/v1/quota/{ORG}/{svc.TRACKING}/burst", json={"units": 4, "window_s": 1})
+    assert r.status_code == 200
+    assert r.json()["burst"]["limit"] == 4
+    assert (await client.post(TRACK, json=track(3))).status_code == 200
+    clock.advance(milliseconds=200)
+    r = await client.post(TRACK, json=track(2))
+    assert r.status_code == 429
+    assert r.json() == {
+        "error": "rate_limited",
+        "feature": svc.TRACKING,
+        "requested": 2,
+        "burst_limit": 4,
+        "retry_after_s": 0.8,
+    }
+    assert r.headers["Retry-After"] == "1"
+    assert await used(client) == 3  # nothing taken from the month
+    clock.advance(milliseconds=800)
+    assert (await client.post(TRACK, json=track(2))).status_code == 200
+
+
+async def test_batch_larger_than_burst_window_has_no_retry_after(client):
+    await client.put(f"/v1/quota/{ORG}/{svc.TRACKING}/burst", json={"units": 4, "window_s": 1})
+    r = await client.post(TRACK, json=track(5))
+    assert r.status_code == 429 and r.json()["retry_after_s"] is None
+    assert "Retry-After" not in r.headers
+
+
+async def test_schedule_search_is_burst_limited(client):
+    await client.put(f"/v1/quota/{ORG}/{svc.SCHEDULES}/burst", json={"units": 1, "window_s": 60})
+    assert (await client.get("/v1/schedules/search", params={"org": ORG})).status_code == 200
+    r = await client.get("/v1/schedules/search", params={"org": ORG})
+    assert r.status_code == 429 and r.json()["error"] == "rate_limited"
+
+
+async def test_delete_burst_limit(client):
+    url = f"/v1/quota/{ORG}/{svc.TRACKING}/burst"
+    await client.put(url, json={"units": 0, "window_s": 1})
+    assert (await client.post(TRACK, json=track(1))).status_code == 429
+    r = await client.delete(url)
+    assert r.status_code == 200 and r.json()["burst"] is None
+    assert (await client.post(TRACK, json=track(1))).status_code == 200
+
+
+async def test_burst_admin_requires_token_when_set(client, monkeypatch):
+    monkeypatch.setattr(svc, "ADMIN_TOKEN", "s3cret")
+    url = f"/v1/quota/{ORG}/{svc.TRACKING}/burst"
+    assert (await client.put(url, json={"units": 5, "window_s": 1})).status_code == 401
+    assert (await client.delete(url)).status_code == 401
+
+
+async def test_admin_rejects_bad_burst(client):
+    url = f"/v1/quota/{ORG}/{svc.TRACKING}/burst"
+    assert (await client.put(url, json={"units": -1, "window_s": 1})).status_code == 422
+    assert (await client.put(url, json={"units": 5, "window_s": 0})).status_code == 422
+
+
 async def test_admin_rejects_negative_limit(client):
     r = await client.put(f"/v1/quota/{ORG}/{svc.TRACKING}", json={"limit": -1})
     assert r.status_code == 422
@@ -170,6 +275,51 @@ def test_load_seed_applies_defaults_and_overrides(tmp_path: Path) -> None:
         ("org-0002", "container-tracking", 5000),
         ("org-0002", "sailing-schedule", 10000),
     ]
+
+
+BURST_SEED = """
+burst:
+  default:
+    container-tracking: {units: 300, window_s: 1}
+  overrides:
+    org-0002:
+      container-tracking: {units: 50, window_s: 0.5}
+      sailing-schedule: {units: 10, window_s: 60}
+"""
+
+
+def test_load_burst_seed_applies_defaults_and_overrides(tmp_path: Path) -> None:
+    p = tmp_path / "quotas.yaml"
+    p.write_text(SEED + BURST_SEED)
+    assert sorted(svc.load_burst_seed(p)) == [
+        ("org-0001", "container-tracking", 300, 1000),
+        ("org-0002", "container-tracking", 50, 500),
+        ("org-0002", "sailing-schedule", 10, 60000),
+    ]
+
+
+def test_load_burst_seed_is_optional(tmp_path: Path) -> None:
+    p = tmp_path / "quotas.yaml"
+    p.write_text(SEED)
+    assert svc.load_burst_seed(p) == []
+
+
+@pytest.mark.parametrize(
+    "bad", ["{units: -1, window_s: 1}", "{units: 5, window_s: 0}", "{units: 5}"]
+)
+def test_load_burst_seed_rejects_bad_values(tmp_path: Path, bad: str) -> None:
+    p = tmp_path / "quotas.yaml"
+    p.write_text(SEED + f"burst:\n  default:\n    container-tracking: {bad}\n")
+    with pytest.raises(ValueError):
+        svc.load_burst_seed(p)
+
+
+async def test_burst_seeding_never_overwrites_admin_changes(redis, quota):
+    await quota.set_limit("org-0001", "f", 100)
+    await quota.set_burst_limit("org-0001", "f", 7, timedelta(seconds=2))  # admin change
+    await svc.seed_bursts(redis, [("org-0001", "f", 300, 1000)])
+    b = (await quota.usage("org-0001", "f")).burst
+    assert b is not None and (b.limit, b.window) == (7, timedelta(seconds=2))
 
 
 def test_load_seed_rejects_bad_limit(tmp_path: Path) -> None:
