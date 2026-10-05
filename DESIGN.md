@@ -125,6 +125,12 @@ pin the clock so the run cannot straddle a boundary). With a window of 60 and a 
 1,000, exactly 60 are granted. With mixed batches against a window of 200,
 `granted == used == window count <= 200`. `tests/test_burst.py` covers the rules above.
 
+Cost: one extra `GET` per reserve when no burst limit is set, plus an `HMGET`/`HSET` when one
+is. An A/B on 5 October 2026 (the previous commit vs this one, alternating rounds, Redis
+`INFO commandstats`) measured 1.3–3.6 µs more per script in the two steady rounds, about
+3–7%. The laptop was busy during that run (about 50 µs per script for both versions, vs
+13.71 µs on 4 October), so the relative difference is the meaningful number.
+
 ## Failure and retries: reserve → commit / release, idempotency keys
 
 - `reserve` holds units (counted against remaining) with a 30 s TTL.
@@ -206,12 +212,11 @@ Two tools, both ending in a correctness audit, so a fast-but-wrong run fails:
   `granted == used <= limit` and `reserved == 0`.
 - `loadtest/loadgen.py` (`make load`): HTTP through nginx to 3 replicas, bursty per org,
   5% downstream failures, client retries reusing the `Idempotency-Key` (always on a lost
-  response, plus 5% of delivered ones). Audit per org touched: `used <= limit`, and
-  the growth in `used` during the run (usage is snapshotted
-  first, so data from earlier runs in the month does not count) equals units clients were
-  told succeeded. A request whose every attempt died in
-  transit has an unknown outcome, so `used` may lie anywhere in
-  `[known, known + unknown]`; anything outside that range fails the run.
+  response, plus 5% of delivered ones). Audit per org touched: `used <= limit`, and the
+  growth in `used` during the run equals the units clients were told succeeded. Usage is
+  snapshotted before the run, so earlier runs in the same month do not count. A request
+  whose every attempt died in transit has an unknown outcome, so the growth may lie
+  anywhere in `[known, known + unknown]`; anything outside that range fails the run.
 
 Measured on an Apple M3 laptop (8 cores: 4 performance + 4 efficiency, 8 GB RAM, macOS 26.5)
 with Docker Desktop 28.1.1 limited to 8 CPUs and 4 GiB. Redis, the 3 API replicas, nginx and

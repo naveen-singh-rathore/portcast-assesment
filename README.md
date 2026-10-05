@@ -31,7 +31,7 @@ is a `429 quota_exceeded`. Run `make down` first to measure the grant path.
 
 ```bash
 make redis-up   # Redis 7.4 in Docker on localhost:6379
-make test       # pytest on the host; expect 108 passed
+make test       # pytest on the host; expect 109 passed
 ```
 
 Without Docker: start any Redis on port 6379 (`redis-server`), then run `pytest`. Tests use
@@ -65,11 +65,11 @@ for limits.
 
 | Run | Result |
 |---|---|
-| `make check` | 78 tests passed (108 with the burst limit, 5 October 2026) |
+| `make check` | 78 tests passed (109 with the burst limit, 5 October 2026) |
 | Concurrency control (`tests/test_concurrency.py`, 3 runs) | Naive GET-then-INCRBY used 818, 1,633 and 1,418 units on a limit of 500. The Lua-backed tests stayed at or under the limit in every run |
 | `make bench` (4 processes x 32 loops, 5,000 orgs, 20 s) | 53,707 quota ops/s; latency p50 2.278 ms, p95 3.758 ms, p99 4.822 ms; **0 invariant violations** across 4,985 orgs. No org reached its limit, so this measures the grant path |
 | `make load` (3 replicas, target 300 req/s, 60 s) | 15,056 requests at 251 req/s achieved. Quota overhead p50 0.563 ms, p99 1.161 ms; end to end p50 9.34 ms, p99 14.78 ms. Status codes: 200: 14,290, 502: 713 (simulated failures), 429: 53. **Audit passed:** 0 orgs over their limit and 0 mismatches across 200 orgs |
-| `make load` with burst limits (300 units/s per org; 100 for org-0001), 5 October 2026 | 15,031 requests at 250 req/s. Quota overhead p50 0.58 ms, p99 1.261 ms. Status codes: 200: 13,985, 502: 692, 429: 354 (343 `rate_limited`, 11 `quota_exceeded`). **Audit passed:** 0 over-limit, 0 mismatches across 200 orgs, on a fresh stack |
+| `make load` with burst limits (300 units/s per org; 100 for org-0001), 5 October 2026, fresh stack | 15,073 requests at 251 req/s. Quota overhead p50 0.569 ms, p99 2.557 ms; end to end p50 9.41 ms, p99 18.25 ms. Status codes: 200: 13,924, 502: 704, 429: 445 (432 `rate_limited`, 13 `quota_exceeded`). **Audit passed:** 0 over-limit, 0 mismatches across 200 orgs. The laptop was busier than on 4 October (load average ~7 on 8 cores), which shows in the tail latency; see [DESIGN.md](DESIGN.md#burst-limit-fixed-window-per-org-feature) for the A/B cost of the burst check |
 | `make load` with faults: one API replica killed at 15 s, Redis restarted at 30 s | 14,496 requests; 109 fast 503s while Redis restarted (fail closed); the other two replicas took the killed one's traffic. **Audit passed:** 0 over-limit, 0 mismatches |
 | Redis `INFO commandstats` | 13.71 µs per `EVALSHA`, so one Redis node tops out at about 73,000 quota ops/s (computed, not measured) |
 
@@ -199,7 +199,7 @@ service/app.py      FastAPI demo service that uses the library
 loadtest/
   bench.py          library benchmark with invariant audit
   loadgen.py        HTTP load generator with client/Redis audit
-tests/              108 tests (unit, real Redis, multi-process, HTTP, audit logic)
+tests/              109 tests (unit, real Redis, multi-process, HTTP, audit logic)
 quotas.yaml         seed limits
 docker-compose.yml  Redis, 3 API replicas, nginx; loadgen/bench under profiles
 Dockerfile          multi-stage: api and loadtest images
