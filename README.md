@@ -511,3 +511,6 @@ DESIGN.md           decisions, measured numbers, limits
 [DESIGN.md](DESIGN.md) explains why the system is built this way. It covers the options that
 were rejected, the concurrency proof, measured load-test numbers, where it falls over, and
 what would change to reach 50,000 orgs.
+
+[AI_USAGE.md](AI_USAGE.md) says how AI was used to build this, who decided what, how the
+AI's output was checked, and what it got wrong.
