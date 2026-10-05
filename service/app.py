@@ -338,6 +338,7 @@ async def set_burst(
 ) -> dict[str, object] | JSONResponse:
     if not _authorized(authorization):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    await _quota().usage(org, feature)  # 403 before writing if the feature is not enabled
     await _quota().set_burst_limit(org, feature, body.units, timedelta(seconds=body.window_s))
     return (await _quota().usage(org, feature)).as_dict()
 

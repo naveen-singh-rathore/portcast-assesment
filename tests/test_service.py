@@ -237,6 +237,12 @@ async def test_burst_admin_requires_token_when_set(client, monkeypatch):
     assert (await client.delete(url)).status_code == 401
 
 
+async def test_burst_on_unconfigured_feature_is_403_and_writes_nothing(client, redis):
+    r = await client.put("/v1/quota/org-0002/other/burst", json={"units": 5, "window_s": 1})
+    assert r.status_code == 403
+    assert await redis.exists("q:{org-0002:other}:burst") == 0
+
+
 async def test_admin_rejects_bad_burst(client):
     url = f"/v1/quota/{ORG}/{svc.TRACKING}/burst"
     assert (await client.put(url, json={"units": -1, "window_s": 1})).status_code == 422
