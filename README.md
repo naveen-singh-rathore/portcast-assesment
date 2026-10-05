@@ -9,7 +9,8 @@ gap is a hard Redis crash, which can lose about 1 s of deductions (see DESIGN.md
 
 ## Quick start
 
-Requires Docker with Compose v2.
+Requires Docker with Compose v2. Starting from nothing? See
+[Running on a new machine](#running-on-a-new-machine).
 
 ```bash
 make load    # builds and starts Redis + 3 API replicas + nginx, then runs a 60 s HTTP load test
@@ -26,6 +27,126 @@ The audit compares what clients were granted with the growth in `used` during th
 snapshots usage first), so repeated runs pass without a reset. Usage does pile up within
 the month, though: after a few runs most orgs are at their limit and nearly every request
 is a `429 quota_exceeded`. Run `make down` first to measure the grant path.
+
+## Running on a new machine
+
+Every step below was run on a fresh clone from GitHub on 5 October 2026.
+
+### 1. Install the prerequisites
+
+| Tool | Needed for | macOS | Ubuntu / Debian | Windows |
+|---|---|---|---|---|
+| Git | cloning | `xcode-select --install` | `sudo apt install git` | Use WSL2 (Ubuntu) and follow the Ubuntu column |
+| Docker with Compose v2 | everything | [Docker Desktop](https://docs.docker.com/desktop/) | [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) + `docker-compose-plugin`; add yourself to the `docker` group | Docker Desktop with the WSL2 backend |
+| make | the `make` shortcuts | included with `xcode-select --install` | `sudo apt install make` | inside WSL2: `sudo apt install make` |
+| Python **3.12** | only tests and checks on the host | `brew install python@3.12` | `sudo apt install python3.12 python3.12-venv` (on older releases, via the deadsnakes PPA) | inside WSL2, as Ubuntu |
+
+Check them:
+
+```bash
+git --version
+docker compose version   # must say v2.x; the old "docker-compose" (v1) will not work
+make --version
+python3.12 --version     # only for step 4
+```
+
+Before you start:
+- **Start Docker** (Docker Desktop must be running).
+- **Give Docker at least 4 CPUs and 4 GB of memory** (Docker Desktop → Settings → Resources).
+  The load test runs Redis, 3 API replicas, nginx and the load generator together.
+- **Free ports 6379 (Redis) and 8080 (the API)**. A local `redis-server` already on 6379 is
+  the usual clash; stop it (`brew services stop redis` or `sudo systemctl stop redis`).
+- Both Intel and Apple Silicon (arm64) work; all images are multi-arch.
+
+### 2. Clone
+
+```bash
+git clone https://github.com/naveen-singh-rathore/portcast-assesment.git
+cd portcast-assesment
+```
+
+### 3. Run the whole stack (Docker only, no Python needed)
+
+```bash
+make load   # first run downloads images and builds: allow a few minutes
+```
+
+It passes if it exits 0 and the report shows `"over_limit_orgs": 0` and
+`"granted_vs_used_mismatches": 0` (see [Quick start](#quick-start)). The stack stays up on
+http://localhost:8080, so you can try the API by hand:
+
+```bash
+# Health, and which replica answered
+curl -s localhost:8080/healthz
+
+# Track 2 containers for org-0042 (1 unit each)
+curl -s -X POST localhost:8080/v1/containers/track \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
+  -d '{"org":"org-0042","containers":["MSCU1234567","MAEU7654321"]}'
+
+# Same key, same body: replayed, not charged again ("replayed": true)
+curl -s -X POST localhost:8080/v1/containers/track \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: demo-1' \
+  -d '{"org":"org-0042","containers":["MSCU1234567","MAEU7654321"]}'
+
+# Monthly usage plus the current burst window
+curl -s localhost:8080/v1/quota/org-0042/container-tracking
+
+# Lower the burst limit to 3 units per 60 s, then send two batches of 2:
+# the first gets 200, the second 429 rate_limited with a Retry-After header
+curl -s -X PUT localhost:8080/v1/quota/org-0042/container-tracking/burst \
+  -H 'Content-Type: application/json' -d '{"units":3,"window_s":60}'
+for i in 1 2; do
+  curl -s -i -X POST localhost:8080/v1/containers/track \
+    -H 'Content-Type: application/json' -d '{"org":"org-0042","containers":["A","B"]}'
+  echo
+done
+```
+
+Interactive API docs (FastAPI) are at http://localhost:8080/docs. Library benchmark:
+`make bench`. When you are done:
+
+```bash
+make down   # stops everything and deletes the Redis data
+```
+
+### 4. Run the tests and checks on the host (optional)
+
+```bash
+python3.12 -m venv .venv          # use python3.12 explicitly: plain python3 may be older
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+make redis-up                     # Redis 7.4 in Docker on localhost:6379
+make check                        # black, ruff, mypy, pytest: the same checks as CI
+make redis-down                   # when finished
+```
+
+`make check` should end with `109 passed`. The tests use Redis DB 15 and **flush it**.
+
+### Without make
+
+Each target is one or two plain commands (see [Makefile](Makefile)):
+
+| make | Equivalent |
+|---|---|
+| `make load` | `docker compose up --build -d --wait`, `docker compose --profile load build loadgen`, then `docker compose --profile load run --rm --no-deps loadgen` |
+| `make bench` | `docker compose up -d --wait redis`, then `docker compose --profile bench run --rm --build bench` |
+| `make redis-up` | `docker compose up -d --wait redis` |
+| `make check` | `black --check . && ruff check . && mypy . && pytest` |
+| `make down` | `docker compose down -v` |
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `port is already allocated` / `address already in use` | Something else holds 6379 or 8080. Stop it, or a stack from another checkout: `docker ps`, then `docker compose down -v` in that folder |
+| `Cannot connect to the Docker daemon` | Docker is not running. Start Docker Desktop (or `sudo systemctl start docker`) |
+| `permission denied ... docker.sock` (Linux) | `sudo usermod -aG docker $USER`, then log out and back in |
+| `unknown flag: --wait` or `docker-compose: command not found` | Compose v1 or an old v2. Install Compose v2.1 or later; the command is `docker compose` |
+| Every request is `429 quota_exceeded` | Repeated `make load` runs used up this month's quota. `make down`, then run again |
+| `pip` fails on a dependency, or mypy/pytest import errors | The venv is not Python 3.12. Delete `.venv` and recreate it with `python3.12 -m venv .venv` |
+| Tests fail with `Connection refused` | Redis is not up: `make redis-up` |
+| Load test far below 250 req/s or slow p99 | Docker has too few CPUs, or the machine is busy. Numbers are machine-dependent; the audit result is what must pass |
 
 ## Running tests
 
@@ -179,7 +300,7 @@ section works the same way (`default` per feature plus per-org `overrides`, each
 ## Development
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt   # runtime deps (redis, fastapi, ...); the tests import them
 make install-dev   # dev tools + the git pre-commit hook (black, ruff, mypy, file checks)
 make format        # auto-fix lint issues and reformat
