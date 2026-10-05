@@ -194,7 +194,71 @@ for limits.
 | `make load` with faults: one API replica killed at 15 s, Redis restarted at 30 s | 14,496 requests; 109 fast 503s while Redis restarted (fail closed); the other two replicas took the killed one's traffic. **Audit passed:** 0 over-limit, 0 mismatches |
 | Redis `INFO commandstats` | 13.71 µs per `EVALSHA`, so one Redis node tops out at about 73,000 quota ops/s (computed, not measured) |
 
-## How it works
+## Architecture
+
+The quota system is a **library**, not a service. Every service instance that sells metered
+features imports `QuotaClient` and talks straight to a shared Redis. All correctness comes
+from one place: each quota operation is a single Lua script that Redis runs atomically. The
+service instances share nothing else, so you can add, kill or restart them freely.
+
+### Components
+
+```mermaid
+flowchart LR
+    subgraph instances["Service instances (any number, stateless)"]
+        direction TB
+        subgraph i1["Instance 1"]
+            e1["Endpoint code"] --> q1["QuotaClient"]
+        end
+        subgraph i2["Instance N"]
+            e2["Endpoint code"] --> q2["QuotaClient"]
+        end
+    end
+    lb["Load balancer"] --> i1
+    lb --> i2
+    q1 -- "EVALSHA: 1 round trip per operation" --> redis[("Redis<br/>counters, holds, idempotency keys,<br/>burst windows, limits")]
+    q2 -- "EVALSHA" --> redis
+    seed["quotas.yaml seed / admin API"] -- "SET NX / SET" --> redis
+```
+
+Inside the library ([quota/](quota/)):
+
+| Module | Responsibility |
+|---|---|
+| [client.py](quota/client.py) | Public API: `reserve`, `consume`, `commit`, `release`, `extend`, `usage`, `hold()`, `set_limit`, `set_burst_limit`. Maps script results to typed errors, retries the operations that are safe to repeat, resolves month disagreements with Redis |
+| [scripts.py](quota/scripts.py) | The Lua scripts. Each one sweeps expired holds, checks, and writes, with nothing able to run in between |
+| [keys.py](quota/keys.py) | Key layout and identifier validation. Every key for one (org, feature) shares the hash tag `{org:feature}` |
+| [periods.py](quota/periods.py) | Billing periods: calendar months in UTC |
+| [errors.py](quota/errors.py) | Typed errors the caller maps to its own responses (`QuotaExceeded`, `RateLimited`, `QuotaUnavailable`, ...) |
+
+### How a request is metered
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Service instance (library)
+    participant R as Redis (Lua, atomic)
+    participant D as Downstream work
+    C->>S: POST /v1/containers/track (Idempotency-Key)
+    S->>R: RESERVE n units
+    Note over R: sweep expired holds<br/>retry of a committed request? replay it<br/>month: used + reserved + n <= limit?<br/>burst window: count + n <= burst limit?<br/>then write the hold (30 s)
+    alt does not fit
+        R-->>S: REJECTED or RATE_LIMITED
+        S-->>C: 429 quota_exceeded or rate_limited
+    else fits
+        R-->>S: OK + reservation id
+        S->>D: do the work (capped at 10 s)
+        alt work succeeded
+            S->>R: COMMIT (held to used)
+            S-->>C: 200
+        else work failed
+            S->>R: RELEASE (held back to remaining)
+            S-->>C: 502
+        end
+    end
+    Note over S,R: If the instance dies before it commits or releases,<br/>the hold expires and the next script call returns the units.
+```
 
 - Each service instance embeds `QuotaClient` and talks to Redis directly; there is no separate
   quota service: [quota/client.py](quota/client.py).
@@ -215,6 +279,119 @@ for limits.
   so a request is admitted only if it fits both. See [DESIGN.md](DESIGN.md#burst-limit-fixed-window-per-org-feature).
 - All keys for one (org, feature) share the hash tag `{org:feature}`, so scripts also work on
   Redis Cluster.
+
+Redis data per (org, feature), all under the hash tag `{org:feature}`:
+
+| Key | Type | Holds | Lifetime |
+|---|---|---|---|
+| `q:{org:feat}:limit` | string | monthly limit | until changed |
+| `q:{org:feat}:burst` | string | `units/window_ms` | until changed or removed |
+| `q:{org:feat}:YYYY-MM` | hash | `used`, `reserved` | the month + 35 days |
+| `q:{org:feat}:YYYY-MM:res` / `:resunits` / `:done` | zset / hash / hash | live holds, their units, and their outcome (committed, released, expired) | the month + 35 days |
+| `q:{org:feat}:win` | hash | current burst window start and count | until the window ends |
+| `q:{org:feat}:idem:<key>` | string | reservation id, units, request fingerprint | 1 hour |
+
+### Why a library
+
+The hard requirement is that a counter shared by many instances never over-serves. That
+correctness comes from Redis running each script atomically, not from where the calling
+code runs. So the question was only how the calling code reaches Redis:
+
+| Option | Extra network hops per request | Verdict |
+|---|---|---|
+| **In-process library + shared Redis (chosen)** | 0 (service to Redis only) | Lowest latency (quota overhead p50 0.57 ms in the load test), no extra fleet to run or scale, and nothing new that can fail apart from Redis itself |
+| Central quota microservice | +1 (service to quota service to Redis) | Language-neutral, but adds a hop, a fleet to operate, and a new failure point, with no gain in correctness |
+| Sidecar per pod (e.g. Envoy rate limit service) | +1 local hop | Language-neutral, but a container per pod and generic rate limiting only: no reserve, commit or release around downstream work |
+| API gateway quotas (e.g. AWS API Gateway usage plans) | 0 | Built in, but AWS documents usage-plan quotas as best effort, not hard limits; they count requests, not units per batch, and cannot return quota when downstream work fails |
+
+What the library costs, and how to change course if that cost grows:
+- **Consumers must be Python.** The Lua scripts are language-neutral, so a Go or Node service
+  needs only a thin port of `client.py`. If many languages need it, wrap the same scripts in a
+  small gRPC service: the scripts move unchanged.
+- **Upgrades roll out with each service.** During a rolling deploy, old and new instances run
+  side by side. Each loads its own script version, so a new rule (such as the burst limit)
+  applies only on upgraded instances until the rollout finishes. Counters stay correct
+  throughout: every version checks the monthly limit.
+
+### Constraints
+
+| Constraint | Effect | Mitigation |
+|---|---|---|
+| Redis is on every metered request | Redis down means `503` (fail closed) | Per-feature fail-open (`FAIL_OPEN_FEATURES`); Multi-AZ replicas with automatic failover |
+| AOF `everysec` persistence | A hard Redis crash can lose about 1 s of deductions, so it can over-serve by that much | A durable store (e.g. Amazon MemoryDB) or reconciliation from a usage-event log |
+| One Redis primary runs scripts serially | About 73,000 quota ops/s per node (computed from 13.71 µs per script) | Redis Cluster: keys are already hash-tagged per (org, feature) |
+| One (org, feature) lives on one slot | A single hot counter cannot be split across nodes | Fine for per-org traffic; very hot orgs would need pre-split sub-quotas |
+| Fixed burst windows | Up to 2× the burst limit across a window boundary | A sliding window counter, in the same script, if it matters |
+| Idempotency keys live 1 hour, outside the month keys | Older retries, or retries across a month boundary, are treated as new requests | Longer TTL at a memory cost (DESIGN.md has the sizing) |
+| Limits live in Redis in the demo | No audit history of limit changes | Postgres as the source of truth, written through to Redis |
+
+DESIGN.md has the full reasoning, the options that were rejected, and the measurements.
+
+### Deploying on AWS
+
+A proposed production layout. The repo runs this shape locally with Docker Compose (nginx in
+place of the ALB, one Redis container in place of ElastiCache); the AWS version has not been
+built or tested.
+
+```mermaid
+flowchart TB
+    users["API clients"] --> edge["Route 53 → AWS WAF → Application Load Balancer"]
+
+    subgraph vpc["VPC across 3 Availability Zones (private subnets)"]
+        subgraph compute["ECS on Fargate or EKS, autoscaled, stateless"]
+            direction LR
+            tracking["Tracking service<br/>FastAPI + quota library"]
+            schedules["Schedules service<br/>FastAPI + quota library"]
+            admin["Admin API<br/>limits and plans"]
+        end
+        subgraph data["Data"]
+            direction LR
+            cache[("ElastiCache for Redis OSS / Valkey<br/>cluster mode, Multi-AZ, TLS + AUTH<br/>counters, holds, burst windows")]
+            rds[("RDS PostgreSQL<br/>limits and plans:<br/>source of truth")]
+        end
+        subgraph pipeline["Usage pipeline (planned)"]
+            direction LR
+            stream["Kinesis Data Streams<br/>usage events"] --> consumer["Consumer: Lambda or ECS<br/>billing, audit, reconciliation"]
+        end
+    end
+
+    edge --> tracking
+    edge --> schedules
+    edge --> admin
+    tracking -- "EVALSHA" --> cache
+    schedules -- "EVALSHA" --> cache
+    admin -- "write-through" --> cache
+    admin -- "write" --> rds
+    compute -. "usage events" .-> stream
+    consumer -.-> rds
+    consumer -.-> s3[("S3 usage archive")]
+    ops["CloudWatch: metrics and logs<br/>Secrets Manager: Redis AUTH, admin token"] -.- compute
+```
+
+Dashed lines are planned parts that this repo does not include yet.
+
+How each piece maps to the code, and what would change:
+
+- **Compute (ECS on Fargate or EKS).** Each service task embeds the library, as the
+  Compose replicas do today. Tasks are stateless, so they scale out on CPU or request count
+  without coordination.
+- **ElastiCache for Redis OSS or Valkey** replaces the Redis container. Point `REDIS_URL` at it
+  with `rediss://` for TLS. For cluster mode, create the client as `RedisCluster` instead of
+  `Redis`: the keys are already hash-tagged, so every script touches a single slot. This
+  change is small but has not been tested against a cluster yet.
+- **Amazon MemoryDB** is the alternative when the 1 s crash window is not acceptable: it
+  writes to a Multi-AZ transaction log before acknowledging, at the cost of slower writes.
+- **RDS PostgreSQL** becomes the source of truth for limits and plans; the admin API writes
+  there and through to Redis, replacing `quotas.yaml` seeding.
+- **Kinesis, a consumer and S3** carry usage events for billing, audit, and reconciling
+  Redis after a failover. This is the main piece still to build (see DESIGN.md, "Getting to
+  50,000 orgs").
+- **CloudWatch** collects per-script latency, rejection rate (`quota_exceeded` vs
+  `rate_limited`), expired holds and fail-open count. **Secrets Manager** holds the Redis
+  AUTH token and `ADMIN_TOKEN`.
+- **Sizing.** One shard handles about 73,000 quota ops/s (computed). 50,000 orgs is about
+  1.5 million counters, a few hundred MB. A 3-shard cluster with one replica per shard
+  leaves wide headroom.
 
 ## API
 
